@@ -101,7 +101,7 @@ impl VmManager {
                     );
                     (exec, args, oci_config.env.clone())
                 }
-                None => (SBIN_INIT.to_string(), vec![], vec![]),
+                None => ("/bin/sh".to_string(), vec!["-c".to_string(), "echo No command specified; exec /bin/sh".to_string()], vec![]),
             };
 
             // Pass exec + args as individual env vars (avoids spaces being truncated
@@ -215,8 +215,8 @@ impl VmManager {
                     }
                 }
                 None => Entrypoint {
-                    executable: SBIN_INIT.to_string(),
-                    args: vec![],
+                    executable: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), "echo No command specified; exec /bin/sh".to_string()],
                     env: vec![],
                 },
             }
@@ -342,8 +342,8 @@ impl VmManager {
             let args: Vec<String> = oci_cmd.iter().skip(1).cloned().collect();
             (exec, args)
         } else {
-            // Neither set: fall back to default init
-            (SBIN_INIT.to_string(), vec![])
+            // Neither set: fall back to /bin/sh (universal across all Linux distros)
+            ("/bin/sh".to_string(), vec!["-c".to_string(), "echo No command specified; exec /bin/sh".to_string()])
         }
     }
 
@@ -612,7 +612,7 @@ mod tests {
         };
 
         let (exec, _args) = VmManager::resolve_oci_entrypoint(&config, &[], None);
-        assert_eq!(exec, "/sbin/init");
+        assert_eq!(exec, "/bin/sh");
     }
 
     #[test]
