@@ -331,8 +331,13 @@ fn launch_sidecar(config: &SidecarConfig) -> Result<(), Box<dyn std::error::Erro
                 vsock_port = config.vsock_port,
                 "Sidecar process launched"
             );
-            // Intentionally leak the Child handle — the zombie-reaper loop
-            // in wait_for_children will reap it when it exits.
+            // Leak the Child handle intentionally.
+            //
+            // Dropping `Child` would reap the sidecar immediately (waitpid on its PID).
+            // Instead, we leak it so that `wait_for_children` (PID 1's zombie reaper)
+            // reaps the sidecar when it eventually exits. This ensures the
+            // sidecar's exit is attributed to the correct reaper and not silently
+            // reaped by the kernel's auto-reaper.
             std::mem::forget(child);
             Ok(())
         }
@@ -780,9 +785,23 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Wait for all child processes and reap zombies.
 ///
-/// Only exits when `container_pid` exits AND `shutdown_requested` is set (SIGTERM).
-/// Otherwise loops forever so background services (exec/PTY/attestation) stay alive
-/// after the container exits — the VM stays alive until explicitly stopped by the host.
+/// ## Lifecycle
+///
+/// Guest init is PID 1 inside the VM. It spawns:
+/// - The container entrypoint process (tracked as `container_pid`)
+/// - Background vsock servers (exec, PTY, attestation, port-forward)
+///   as child threads/processes
+///
+/// The VM should stay alive after `container_pid` exits so that vsock
+/// clients on the host can still communicate with the background servers
+/// (e.g. for exec requests or interactive PTY sessions). The VM exits
+/// only when the host sends SIGTERM.
+///
+/// ## Shutdown sequence
+///
+/// 1. Host sends SIGTERM → `SHUTDOWN_REQUESTED` is set via signal handler
+/// 2. `wait_for_children` detects the flag, calls `graceful_shutdown`
+/// 3. `graceful_shutdown`: SIGTERM → all processes in PID namespace → wait → SIGKILL
 fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std::error::Error>> {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     use nix::unistd::Pid;
@@ -793,7 +812,7 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
     info!("Waiting for child processes");
 
     loop {
-        // Check if shutdown was requested via SIGTERM
+        // Check if host sent SIGTERM (via signal handler setting SHUTDOWN_REQUESTED)
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             info!("SIGTERM received, initiating graceful shutdown");
             graceful_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
@@ -803,22 +822,17 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(pid, status)) => {
                 if pid == container_pid {
-                    // Container exited — keep the VM alive so vsock services remain available.
-                    // The host stops the VM via SIGTERM, at which point graceful_shutdown runs.
+                    // Container process (e.g. busybox init) exited.
+                    // Keep VM alive — vsock servers are still running as other children.
+                    // VM exits only when host sends SIGTERM.
                     info!(
                         "Container process {} exited with status {}. \
                          VM staying alive for vsock services (stop with Ctrl-C)",
                         pid, status
                     );
-                    // Loop forever — VM stays alive until SIGTERM from host
-                    loop {
-                        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                            info!("SIGTERM received during container-exited idle, shutting down");
-                            graceful_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
-                            return Ok(());
-                        }
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                    }
+                    // Idle loop: sleep until SIGTERM, then shutdown
+                    idle_until_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
+                    return Ok(());
                 } else {
                     info!(
                         "Child process {} exited with status {} (reaped)",
@@ -828,15 +842,10 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
             }
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
                 if pid == container_pid {
+                    // Container was killed by a signal (e.g. SIGKILL from host)
                     error!("Container process {} killed by signal {:?}", pid, signal);
-                    loop {
-                        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                            info!("SIGTERM received, shutting down");
-                            graceful_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
-                            return Ok(());
-                        }
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                    }
+                    idle_until_shutdown(CHILD_SHUTDOWN_TIMEOUT_MS);
+                    return Ok(());
                 } else if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                     info!(
                         "Child process {} terminated by signal {:?} during shutdown",
@@ -850,14 +859,14 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
                 }
             }
             Ok(WaitStatus::StillAlive) => {
-                // No children to reap, sleep briefly
+                // No children ready to reap, sleep briefly before polling again
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Ok(_) => {
-                // Other status, continue waiting
+                // Other status (Stopped, Continued, etc.), keep waiting
             }
             Err(nix::errno::Errno::ECHILD) => {
-                // No more children
+                // No more children in the namespace
                 info!("No more child processes");
                 break;
             }
@@ -870,13 +879,32 @@ fn wait_for_children(container_pid: nix::unistd::Pid) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// Idle loop: sleep until `SHUTDOWN_REQUESTED` is set (SIGTERM from host),
+/// then perform graceful shutdown. Used after the container process exits
+/// so the VM stays alive for vsock clients while avoiding CPU spin.
+fn idle_until_shutdown(timeout_ms: u64) {
+    loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            info!("SIGTERM received, shutting down");
+            graceful_shutdown(timeout_ms);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 /// Perform graceful shutdown: forward SIGTERM to children, wait, then force-kill.
 fn graceful_shutdown(timeout_ms: u64) {
-    // Step 1: Send SIGTERM to all processes (except ourselves, PID 1)
+    // Step 1: Send SIGTERM to all processes in the VM's PID namespace.
+    //
+    // kill(-1, SIGTERM) sends SIGTERM to every process the caller can send
+    // signals to. Inside a PID namespace, guest init (PID 1) can signal all
+    // other processes — including vsock servers, sidecar, and the container
+    // entrypoint. PID 1 itself is exempt because the kernel does not deliver
+    // SIGTERM to an init process that hasn't registered a handler for it.
     #[cfg(target_os = "linux")]
     {
-        info!("Forwarding SIGTERM to all child processes");
-        // kill(-1, SIGTERM) sends to all processes except PID 1
+        info!("Forwarding SIGTERM to all processes in VM");
         unsafe {
             libc::kill(-1, libc::SIGTERM);
         }
