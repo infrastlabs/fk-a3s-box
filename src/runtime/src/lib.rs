@@ -9,7 +9,7 @@
 //! - `scale` — Multi-node scale manager and instance registry (enabled by default)
 //! - `compose` — Multi-container compose orchestration (enabled by default)
 //! - `operator` — Kubernetes CRD autoscaler controller (enabled by default)
-//! - `build` — Dockerfile build engine (enabled by default)
+//! - `build` — Dockerfile/Containerfile build engine (enabled by default)
 
 #![allow(clippy::result_large_err)]
 

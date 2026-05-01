@@ -1057,11 +1057,12 @@ fn test_real_vm_command_matrix() {
     cli.ok(&["build", "--tag", built_image, "--quiet", &build_dir_arg]);
     cli.ok(&["image-inspect", built_image]);
 
+    std::fs::remove_file(build_dir.join("Dockerfile")).expect("remove Dockerfile");
     std::fs::write(
-        build_dir.join("Dockerfile"),
+        build_dir.join("Containerfile"),
         format!("FROM {image}\nCMD [\"sleep\", \"3600\"]\n"),
     )
-    .expect("write pool Dockerfile");
+    .expect("write pool Containerfile");
     cli.ok(&["build", "--tag", pool_image, "--quiet", &build_dir_arg]);
     cli.ok(&["image-inspect", pool_image]);
     let (pool_stdout, pool_stderr) = cli.interrupts_after_output(
