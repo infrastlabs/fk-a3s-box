@@ -236,7 +236,12 @@ fn find_system_libkrun() -> Result<PathBuf, String> {
         .atleast_version("1.0")
         .probe("libkrun")
     {
-        if let Some(path) = lib.link_paths.first() {
+        // Some distributions (notably Homebrew's `libkrun-efi` formula on
+        // macOS) ship a misleading `libkrun.pc` whose libdir points at a
+        // directory that only contains `libkrun-efi.dylib`, not the bare
+        // `libkrun.dylib` the linker looks for via `-lkrun`. Validate the
+        // path before trusting it; otherwise fall through to common paths.
+        if let Some(path) = lib.link_paths.iter().find(|p| has_exact_library(p, "krun")) {
             return Ok(path.clone());
         }
     }
@@ -248,12 +253,46 @@ fn find_system_libkrun() -> Result<PathBuf, String> {
 
     for path in common_paths {
         let lib_path = Path::new(path);
-        if has_library(lib_path, "libkrun") {
+        if has_exact_library(lib_path, "krun") {
             return Ok(lib_path.to_path_buf());
         }
     }
 
     Err("libkrun not found in system paths".to_string())
+}
+
+/// Like `has_library`, but requires the file to be named exactly
+/// `lib<name>.<ext>` or `lib<name>.<version>.<ext>` — i.e. the character
+/// after the name must be a `.` (or end of stem). This prevents matching
+/// against sibling libraries such as `libkrun-efi.dylib` when looking for
+/// `libkrun.dylib`.
+fn has_exact_library(dir: &Path, name: &str) -> bool {
+    let extensions: &[&str] = if cfg!(target_os = "macos") {
+        &["dylib"]
+    } else if cfg!(target_os = "linux") {
+        &["so"]
+    } else {
+        &["dll"]
+    };
+
+    let prefix = format!("lib{name}");
+    dir.read_dir()
+        .ok()
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let filename = entry.file_name().to_string_lossy().to_string();
+                let Some(rest) = filename.strip_prefix(&prefix) else {
+                    return false;
+                };
+                if !rest.starts_with('.') {
+                    return false;
+                }
+                extensions
+                    .iter()
+                    .any(|ext| entry.path().extension().is_some_and(|e| e == *ext))
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Returns libkrun build environment with features enabled.
