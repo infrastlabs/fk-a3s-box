@@ -7,6 +7,7 @@ mod build;
 mod commit;
 pub(crate) mod common;
 mod compose;
+mod container;
 mod container_update;
 mod cp;
 mod create;
@@ -89,6 +90,8 @@ pub enum Command {
     Restart(restart::RestartArgs),
     /// Remove one or more boxes
     Rm(rm::RmArgs),
+    /// Manage boxes using Docker-style container subcommands
+    Container(container::ContainerArgs),
     /// Force-kill one or more running boxes
     Kill(kill::KillArgs),
     /// Pause one or more running boxes
@@ -255,6 +258,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Stop(args) => stop::execute(args).await,
         Command::Restart(args) => restart::execute(args).await,
         Command::Rm(args) => rm::execute(args).await,
+        Command::Container(args) => container::execute(args).await,
         Command::Kill(args) => kill::execute(args).await,
         Command::Pause(args) => pause::execute(args).await,
         Command::Unpause(args) => unpause::execute(args).await,
@@ -361,5 +365,69 @@ mod tests {
         };
 
         assert_eq!(args.image, "nginx");
+    }
+
+    #[test]
+    fn test_parse_container_ls_namespace() {
+        let cli = Cli::try_parse_from(["a3s-box", "container", "ls", "-a", "-q"]).unwrap();
+
+        let Command::Container(args) = cli.command else {
+            panic!("expected container command");
+        };
+        let container::ContainerCommand::Ls(args) = args.command else {
+            panic!("expected container ls command");
+        };
+
+        assert!(args.all);
+        assert!(args.quiet);
+    }
+
+    #[test]
+    fn test_parse_container_list_alias() {
+        let cli = Cli::try_parse_from(["a3s-box", "container", "list"]).unwrap();
+
+        let Command::Container(args) = cli.command else {
+            panic!("expected container command");
+        };
+        assert!(matches!(args.command, container::ContainerCommand::Ls(_)));
+    }
+
+    #[test]
+    fn test_parse_container_ps_alias() {
+        let cli = Cli::try_parse_from(["a3s-box", "container", "ps"]).unwrap();
+
+        let Command::Container(args) = cli.command else {
+            panic!("expected container command");
+        };
+        assert!(matches!(args.command, container::ContainerCommand::Ls(_)));
+    }
+
+    #[test]
+    fn test_parse_container_remove_alias() {
+        let cli = Cli::try_parse_from(["a3s-box", "container", "remove", "-f", "web"]).unwrap();
+
+        let Command::Container(args) = cli.command else {
+            panic!("expected container command");
+        };
+        let container::ContainerCommand::Rm(args) = args.command else {
+            panic!("expected container rm command");
+        };
+
+        assert!(args.force);
+        assert_eq!(args.boxes, vec!["web"]);
+    }
+
+    #[test]
+    fn test_parse_container_inspect_namespace() {
+        let cli = Cli::try_parse_from(["a3s-box", "container", "inspect", "web"]).unwrap();
+
+        let Command::Container(args) = cli.command else {
+            panic!("expected container command");
+        };
+        let container::ContainerCommand::Inspect(args) = args.command else {
+            panic!("expected container inspect command");
+        };
+
+        assert_eq!(args.r#box, "web");
     }
 }
