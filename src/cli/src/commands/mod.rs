@@ -16,6 +16,7 @@ mod events;
 pub(crate) mod exec;
 mod export;
 mod history;
+mod image;
 mod image_inspect;
 mod image_prune;
 mod image_tag;
@@ -142,6 +143,8 @@ pub enum Command {
     Build(build::BuildArgs),
     /// List cached images
     Images(images::ImagesArgs),
+    /// Manage images
+    Image(image::ImageArgs),
     /// Pull an image from a registry
     Pull(pull::PullArgs),
     /// Push an image to a registry
@@ -279,6 +282,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Snapshot(args) => snapshot::execute(args).await,
         Command::Build(args) => build::execute(args).await,
         Command::Images(args) => images::execute(args).await,
+        Command::Image(args) => image::execute(args).await,
         Command::Pull(args) => pull::execute(args).await,
         Command::Push(args) => push::execute(args).await,
         Command::Login(args) => login::execute(args).await,
@@ -300,5 +304,62 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Monitor(args) => monitor::execute(args).await,
         Command::Pool(args) => pool::execute(args).await,
         Command::Shell(args) => shell::execute(args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_image_ls_namespace() {
+        let cli = Cli::try_parse_from(["a3s-box", "image", "ls", "-q"]).unwrap();
+
+        let Command::Image(args) = cli.command else {
+            panic!("expected image command");
+        };
+        let image::ImageCommand::Ls(args) = args.command else {
+            panic!("expected image ls command");
+        };
+
+        assert!(args.quiet);
+    }
+
+    #[test]
+    fn test_parse_image_list_alias() {
+        let cli = Cli::try_parse_from(["a3s-box", "image", "list"]).unwrap();
+
+        let Command::Image(args) = cli.command else {
+            panic!("expected image command");
+        };
+        assert!(matches!(args.command, image::ImageCommand::Ls(_)));
+    }
+
+    #[test]
+    fn test_parse_image_remove_alias() {
+        let cli = Cli::try_parse_from(["a3s-box", "image", "remove", "nginx"]).unwrap();
+
+        let Command::Image(args) = cli.command else {
+            panic!("expected image command");
+        };
+        let image::ImageCommand::Rm(args) = args.command else {
+            panic!("expected image rm command");
+        };
+
+        assert_eq!(args.images, vec!["nginx"]);
+    }
+
+    #[test]
+    fn test_parse_image_inspect_namespace() {
+        let cli = Cli::try_parse_from(["a3s-box", "image", "inspect", "nginx"]).unwrap();
+
+        let Command::Image(args) = cli.command else {
+            panic!("expected image command");
+        };
+        let image::ImageCommand::Inspect(args) = args.command else {
+            panic!("expected image inspect command");
+        };
+
+        assert_eq!(args.image, "nginx");
     }
 }
