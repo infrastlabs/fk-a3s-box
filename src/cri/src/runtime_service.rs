@@ -5,6 +5,7 @@
 //! - Container → Session within Box
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -420,6 +421,87 @@ fn runtime_condition(r#type: &str, status: bool, reason: &str, message: &str) ->
         status,
         reason: reason.to_string(),
         message: message.to_string(),
+    }
+}
+
+fn container_stats_from_record(container: &Container, store_dir: &Path) -> ContainerStats {
+    let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+    ContainerStats {
+        attributes: Some(ContainerAttributes {
+            id: container.id.clone(),
+            metadata: Some(ContainerMetadata {
+                name: container.name.clone(),
+                attempt: 0,
+            }),
+            labels: container.labels.clone(),
+            annotations: container.annotations.clone(),
+        }),
+        cpu: Some(CpuUsage {
+            timestamp,
+            usage_core_nano_seconds: Some(UInt64Value { value: 0 }),
+            usage_nano_cores: Some(UInt64Value { value: 0 }),
+        }),
+        memory: Some(MemoryUsage {
+            timestamp,
+            working_set_bytes: Some(UInt64Value { value: 0 }),
+            available_bytes: None,
+            usage_bytes: Some(UInt64Value { value: 0 }),
+            rss_bytes: Some(UInt64Value { value: 0 }),
+            page_faults: None,
+            major_page_faults: None,
+        }),
+        writable_layer: Some(WritableLayerUsage {
+            timestamp,
+            fs_id: Some(FilesystemIdentifier {
+                mountpoint: store_dir.to_string_lossy().to_string(),
+            }),
+            used_bytes: Some(UInt64Value { value: 0 }),
+            inodes_used: None,
+        }),
+    }
+}
+
+fn pod_sandbox_stats_from_record(
+    sandbox: &PodSandbox,
+    containers: Vec<Container>,
+    store_dir: &Path,
+) -> PodSandboxStats {
+    let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let container_stats = containers
+        .iter()
+        .map(|container| container_stats_from_record(container, store_dir))
+        .collect();
+
+    PodSandboxStats {
+        attributes: Some(PodSandboxAttributes {
+            id: sandbox.id.clone(),
+            metadata: Some(PodSandboxMetadata {
+                name: sandbox.name.clone(),
+                uid: sandbox.uid.clone(),
+                namespace: sandbox.namespace.clone(),
+                attempt: 0,
+            }),
+            labels: sandbox.labels.clone(),
+            annotations: sandbox.annotations.clone(),
+        }),
+        linux: Some(LinuxPodSandboxStats {
+            cpu: Some(CpuUsage {
+                timestamp,
+                usage_core_nano_seconds: Some(UInt64Value { value: 0 }),
+                usage_nano_cores: Some(UInt64Value { value: 0 }),
+            }),
+            memory: Some(MemoryUsage {
+                timestamp,
+                working_set_bytes: Some(UInt64Value { value: 0 }),
+                available_bytes: None,
+                usage_bytes: Some(UInt64Value { value: 0 }),
+                rss_bytes: Some(UInt64Value { value: 0 }),
+                page_faults: None,
+                major_page_faults: None,
+            }),
+            containers: container_stats,
+        }),
     }
 }
 
@@ -1105,6 +1187,117 @@ impl RuntimeService for BoxRuntimeService {
             .collect();
 
         Ok(Response::new(ListContainersResponse { containers: items }))
+    }
+
+    async fn container_stats(
+        &self,
+        request: Request<ContainerStatsRequest>,
+    ) -> Result<Response<ContainerStatsResponse>, Status> {
+        let req = request.into_inner();
+        let container_id = &req.container_id;
+
+        let container = self
+            .store
+            .containers
+            .get(container_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
+
+        Ok(Response::new(ContainerStatsResponse {
+            stats: Some(container_stats_from_record(
+                &container,
+                self.image_store.store_dir(),
+            )),
+        }))
+    }
+
+    async fn list_container_stats(
+        &self,
+        request: Request<ListContainerStatsRequest>,
+    ) -> Result<Response<ListContainerStatsResponse>, Status> {
+        let req = request.into_inner();
+        let sandbox_filter = req
+            .filter
+            .as_ref()
+            .map(|filter| filter.pod_sandbox_id.as_str())
+            .filter(|sandbox_id| !sandbox_id.is_empty());
+        let label_filter = req
+            .filter
+            .as_ref()
+            .map(|filter| &filter.label_selector)
+            .filter(|labels| !labels.is_empty());
+
+        let stats = self
+            .store
+            .containers
+            .list(sandbox_filter, label_filter)
+            .await
+            .into_iter()
+            .filter(|container| {
+                req.filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.id.is_empty() || filter.id == container.id)
+            })
+            .map(|container| container_stats_from_record(&container, self.image_store.store_dir()))
+            .collect();
+
+        Ok(Response::new(ListContainerStatsResponse { stats }))
+    }
+
+    async fn pod_sandbox_stats(
+        &self,
+        request: Request<PodSandboxStatsRequest>,
+    ) -> Result<Response<PodSandboxStatsResponse>, Status> {
+        let req = request.into_inner();
+        let sandbox_id = &req.pod_sandbox_id;
+
+        let sandbox = self
+            .store
+            .sandboxes
+            .get(sandbox_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("Sandbox not found: {}", sandbox_id)))?;
+        let containers = self.store.containers.list(Some(sandbox_id), None).await;
+
+        Ok(Response::new(PodSandboxStatsResponse {
+            stats: Some(pod_sandbox_stats_from_record(
+                &sandbox,
+                containers,
+                self.image_store.store_dir(),
+            )),
+        }))
+    }
+
+    async fn list_pod_sandbox_stats(
+        &self,
+        request: Request<ListPodSandboxStatsRequest>,
+    ) -> Result<Response<ListPodSandboxStatsResponse>, Status> {
+        let req = request.into_inner();
+        let label_filter = req
+            .filter
+            .as_ref()
+            .map(|filter| &filter.label_selector)
+            .filter(|labels| !labels.is_empty());
+
+        let mut stats = Vec::new();
+        for sandbox in self.store.sandboxes.list(label_filter).await {
+            if req
+                .filter
+                .as_ref()
+                .is_some_and(|filter| !filter.id.is_empty() && filter.id != sandbox.id)
+            {
+                continue;
+            }
+
+            let containers = self.store.containers.list(Some(&sandbox.id), None).await;
+            stats.push(pod_sandbox_stats_from_record(
+                &sandbox,
+                containers,
+                self.image_store.store_dir(),
+            ));
+        }
+
+        Ok(Response::new(ListPodSandboxStatsResponse { stats }))
     }
 
     // ── Status ───────────────────────────────────────────────────────
@@ -2482,6 +2675,115 @@ mod tests {
             .into_inner();
         assert_eq!(resp.containers.len(), 1);
         assert_eq!(resp.containers[0].id, "c-1");
+    }
+
+    // ── Stats ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_container_stats_found() {
+        let svc = make_test_service();
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
+
+        let resp = svc
+            .container_stats(Request::new(ContainerStatsRequest {
+                container_id: "c-1".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let stats = resp.stats.unwrap();
+        let attrs = stats.attributes.unwrap();
+        assert_eq!(attrs.id, "c-1");
+        assert_eq!(attrs.metadata.unwrap().name, "container-c-1");
+        assert_eq!(stats.cpu.unwrap().usage_core_nano_seconds.unwrap().value, 0);
+    }
+
+    #[tokio::test]
+    async fn test_container_stats_not_found() {
+        let svc = make_test_service();
+        let err = svc
+            .container_stats(Request::new(ContainerStatsRequest {
+                container_id: "missing".to_string(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_list_container_stats_filters_by_sandbox() {
+        let svc = make_test_service();
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
+        svc.store
+            .containers
+            .add(test_container("c-2", "sb-2"))
+            .await;
+
+        let resp = svc
+            .list_container_stats(Request::new(ListContainerStatsRequest {
+                filter: Some(ContainerStatsFilter {
+                    id: String::new(),
+                    pod_sandbox_id: "sb-1".to_string(),
+                    label_selector: HashMap::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.stats.len(), 1);
+        assert_eq!(resp.stats[0].attributes.as_ref().unwrap().id, "c-1");
+    }
+
+    #[tokio::test]
+    async fn test_pod_sandbox_stats_includes_container_stats() {
+        let svc = make_test_service();
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
+
+        let resp = svc
+            .pod_sandbox_stats(Request::new(PodSandboxStatsRequest {
+                pod_sandbox_id: "sb-1".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let stats = resp.stats.unwrap();
+        assert_eq!(stats.attributes.as_ref().unwrap().id, "sb-1");
+        assert_eq!(stats.linux.unwrap().containers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_pod_sandbox_stats_filters_by_id() {
+        let svc = make_test_service();
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+        svc.store.sandboxes.add(test_sandbox("sb-2")).await;
+
+        let resp = svc
+            .list_pod_sandbox_stats(Request::new(ListPodSandboxStatsRequest {
+                filter: Some(PodSandboxStatsFilter {
+                    id: "sb-2".to_string(),
+                    label_selector: HashMap::new(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.stats.len(), 1);
+        assert_eq!(resp.stats[0].attributes.as_ref().unwrap().id, "sb-2");
     }
 
     // ── UpdateContainerResources ─────────────────────────────────────
