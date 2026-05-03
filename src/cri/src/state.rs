@@ -110,6 +110,8 @@ mod tests {
             annotations: HashMap::new(),
             log_directory: "/var/log/pods".to_string(),
             runtime_handler: "a3s".to_string(),
+            network_name: None,
+            ip_address: None,
         }
     }
 

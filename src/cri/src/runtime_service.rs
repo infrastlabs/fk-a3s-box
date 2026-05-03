@@ -11,6 +11,8 @@ use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 use a3s_box_core::event::EventEmitter;
+use a3s_box_core::{NetworkEndpoint, NetworkMode};
+use a3s_box_runtime::network::NetworkStore;
 use a3s_box_runtime::oci::{ImageStore, OciImage, OciImageConfig, RegistryAuth};
 use a3s_box_runtime::pool::WarmPool;
 use a3s_box_runtime::vm::VmManager;
@@ -158,16 +160,24 @@ impl BoxRuntimeService {
     async fn acquire_vm(
         &self,
         box_config: a3s_box_core::config::BoxConfig,
-    ) -> Result<VmManager, Status> {
-        if let Some(ref pool) = self.warm_pool {
-            let pool = pool.read().await;
-            match pool.acquire().await {
-                Ok(vm) => {
-                    tracing::debug!(box_id = %vm.box_id(), "Acquired VM from warm pool");
-                    return Ok(vm);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Warm pool acquire failed, falling back to cold boot");
+        box_name: &str,
+    ) -> Result<(VmManager, Option<NetworkEndpoint>), Status> {
+        let bridge_network = match &box_config.network {
+            NetworkMode::Bridge { network } => Some(network.clone()),
+            _ => None,
+        };
+
+        if bridge_network.is_none() {
+            if let Some(ref pool) = self.warm_pool {
+                let pool = pool.read().await;
+                match pool.acquire().await {
+                    Ok(vm) => {
+                        tracing::debug!(box_id = %vm.box_id(), "Acquired VM from warm pool");
+                        return Ok((vm, None));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Warm pool acquire failed, falling back to cold boot");
+                    }
                 }
             }
         }
@@ -175,8 +185,24 @@ impl BoxRuntimeService {
         // Cold boot
         let event_emitter = EventEmitter::new(256);
         let mut vm = VmManager::new(box_config, event_emitter);
-        vm.boot().await.map_err(box_error_to_status)?;
-        Ok(vm)
+        let network_endpoint = if let Some(network_name) = bridge_network.as_deref() {
+            Some(connect_cri_network_endpoint(
+                network_name,
+                vm.box_id(),
+                box_name,
+            )?)
+        } else {
+            None
+        };
+
+        if let Err(error) = vm.boot().await {
+            if let Some(network_name) = bridge_network.as_deref() {
+                disconnect_cri_network_endpoint(network_name, vm.box_id());
+            }
+            return Err(box_error_to_status(error));
+        }
+
+        Ok((vm, network_endpoint))
     }
 
     /// Load OCI image configuration from the local image store.
@@ -269,6 +295,64 @@ impl BoxRuntimeService {
     }
 }
 
+fn connect_cri_network_endpoint(
+    network_name: &str,
+    box_id: &str,
+    box_name: &str,
+) -> Result<NetworkEndpoint, Status> {
+    let store = NetworkStore::default_path().map_err(box_error_to_status)?;
+    connect_cri_network_endpoint_in_store(&store, network_name, box_id, box_name)
+}
+
+fn connect_cri_network_endpoint_in_store(
+    store: &NetworkStore,
+    network_name: &str,
+    box_id: &str,
+    box_name: &str,
+) -> Result<NetworkEndpoint, Status> {
+    let mut network = store
+        .get(network_name)
+        .map_err(box_error_to_status)?
+        .ok_or_else(|| Status::not_found(format!("Network not found: {}", network_name)))?;
+
+    let endpoint = network
+        .connect(box_id, box_name)
+        .map_err(|e| Status::failed_precondition(format!("Failed to connect CRI network: {e}")))?;
+    store.update(&network).map_err(box_error_to_status)?;
+
+    Ok(endpoint)
+}
+
+fn disconnect_cri_network_endpoint(network_name: &str, box_id: &str) {
+    let result = (|| -> Result<(), Status> {
+        let store = NetworkStore::default_path().map_err(box_error_to_status)?;
+        disconnect_cri_network_endpoint_in_store(&store, network_name, box_id)
+    })();
+
+    if let Err(error) = result {
+        tracing::warn!(
+            network = network_name,
+            box_id,
+            error = %error,
+            "Failed to disconnect CRI network endpoint"
+        );
+    }
+}
+
+fn disconnect_cri_network_endpoint_in_store(
+    store: &NetworkStore,
+    network_name: &str,
+    box_id: &str,
+) -> Result<(), Status> {
+    let Some(mut network) = store.get(network_name).map_err(box_error_to_status)? else {
+        return Ok(());
+    };
+    if network.disconnect(box_id).is_ok() {
+        store.update(&network).map_err(box_error_to_status)?;
+    }
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl RuntimeService for BoxRuntimeService {
     // ── Version ──────────────────────────────────────────────────────
@@ -315,8 +399,13 @@ impl RuntimeService for BoxRuntimeService {
         )
         .map_err(box_error_to_status)?;
 
+        let network_name = match &box_config.network {
+            NetworkMode::Bridge { network } => Some(network.clone()),
+            _ => None,
+        };
+
         // Acquire VM: from warm pool if available, otherwise cold boot
-        let vm = self.acquire_vm(box_config).await?;
+        let (vm, network_endpoint) = self.acquire_vm(box_config, &metadata.name).await?;
         let sandbox_id = vm.box_id().to_string();
 
         // Store sandbox state
@@ -332,6 +421,8 @@ impl RuntimeService for BoxRuntimeService {
             annotations: config.annotations.clone(),
             log_directory: config.log_directory.clone(),
             runtime_handler: req.runtime_handler,
+            network_name,
+            ip_address: network_endpoint.map(|endpoint| endpoint.ip_address.to_string()),
         };
 
         self.store.add_sandbox(sandbox).await;
@@ -385,6 +476,8 @@ impl RuntimeService for BoxRuntimeService {
         tracing::info!(sandbox_id = %sandbox_id, "CRI RemovePodSandbox");
 
         // Release VM back to warm pool (or destroy if no pool)
+        let removed_sandbox = self.store.sandboxes.get(sandbox_id).await;
+
         if let Some(vm) = self.vm_managers.write().await.remove(sandbox_id) {
             self.release_vm(vm).await;
         }
@@ -394,6 +487,12 @@ impl RuntimeService for BoxRuntimeService {
 
         // Remove sandbox
         self.store.remove_sandbox(sandbox_id).await;
+
+        if let Some(sandbox) = removed_sandbox {
+            if let Some(network_name) = sandbox.network_name.as_deref() {
+                disconnect_cri_network_endpoint(network_name, sandbox_id);
+            }
+        }
 
         Ok(Response::new(RemovePodSandboxResponse {}))
     }
@@ -428,7 +527,7 @@ impl RuntimeService for BoxRuntimeService {
             state: state.into(),
             created_at: sandbox.created_at,
             network: Some(PodSandboxNetworkStatus {
-                ip: String::new(),
+                ip: sandbox.ip_address.clone().unwrap_or_default(),
                 additional_ips: vec![],
             }),
             linux: None,
@@ -1454,6 +1553,8 @@ mod tests {
             annotations: HashMap::new(),
             log_directory: "/var/log/pods".to_string(),
             runtime_handler: "a3s".to_string(),
+            network_name: None,
+            ip_address: None,
         }
     }
 
@@ -1642,6 +1743,47 @@ mod tests {
         let meta = status.metadata.unwrap();
         assert_eq!(meta.name, "pod-sb-1");
         assert_eq!(meta.namespace, "default");
+    }
+
+    #[tokio::test]
+    async fn test_pod_sandbox_status_reports_network_ip() {
+        let svc = make_test_service();
+        let mut sandbox = test_sandbox("sb-1");
+        sandbox.network_name = Some("k8s-pods".to_string());
+        sandbox.ip_address = Some("10.88.0.2".to_string());
+        svc.store.sandboxes.add(sandbox).await;
+
+        let resp = svc
+            .pod_sandbox_status(Request::new(PodSandboxStatusRequest {
+                pod_sandbox_id: "sb-1".to_string(),
+                verbose: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let status = resp.status.unwrap();
+        assert_eq!(status.network.unwrap().ip, "10.88.0.2");
+    }
+
+    #[test]
+    fn test_cri_network_endpoint_connect_and_disconnect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = NetworkStore::new(tmp.path().join("networks.json"));
+        store
+            .create(a3s_box_core::NetworkConfig::new("k8s-pods", "10.88.0.0/24").unwrap())
+            .unwrap();
+
+        let endpoint =
+            connect_cri_network_endpoint_in_store(&store, "k8s-pods", "sb-1", "pod-sb-1").unwrap();
+
+        assert_eq!(endpoint.ip_address.to_string(), "10.88.0.2");
+        let network = store.get("k8s-pods").unwrap().unwrap();
+        assert!(network.endpoints.contains_key("sb-1"));
+
+        disconnect_cri_network_endpoint_in_store(&store, "k8s-pods", "sb-1").unwrap();
+        let network = store.get("k8s-pods").unwrap().unwrap();
+        assert!(!network.endpoints.contains_key("sb-1"));
     }
 
     #[tokio::test]
@@ -2526,7 +2668,7 @@ mod tests {
         // Without a warm pool, acquire_vm cold-boots — which fails in unit test env
         let svc = make_test_service();
         let config = a3s_box_core::config::BoxConfig::default();
-        let result = svc.acquire_vm(config).await;
+        let result = svc.acquire_vm(config, "test-pod").await;
         // Expected: error because no shim binary available
         assert!(result.is_err());
     }

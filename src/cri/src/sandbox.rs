@@ -42,6 +42,12 @@ pub struct PodSandbox {
     pub log_directory: String,
     /// Runtime handler name.
     pub runtime_handler: String,
+    /// A3S network name assigned to this sandbox, if bridge networking is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
+    /// Pod sandbox IP address assigned by A3S IPAM, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
 }
 
 /// In-memory store for pod sandboxes.
@@ -125,6 +131,8 @@ mod tests {
             annotations: HashMap::new(),
             log_directory: "/var/log/pods".to_string(),
             runtime_handler: "a3s".to_string(),
+            network_name: None,
+            ip_address: None,
         }
     }
 

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use a3s_box_core::config::{BoxConfig, ResourceConfig, TeeConfig};
 use a3s_box_core::error::{BoxError, Result};
+use a3s_box_core::NetworkMode;
 
 use crate::cri_api::PodSandboxConfig;
 
@@ -17,6 +18,7 @@ const ANN_AGENT_IMAGE: &str = "a3s.box/agent-image";
 const ANN_VCPUS: &str = "a3s.box/vcpus";
 const ANN_MEMORY_MB: &str = "a3s.box/memory-mb";
 const ANN_DISK_MB: &str = "a3s.box/disk-mb";
+const ANN_NETWORK: &str = "a3s.box/network";
 const ANN_TEE: &str = "a3s.box/tee";
 const ANN_TEE_WORKLOAD_ID: &str = "a3s.box/tee-workload-id";
 
@@ -47,11 +49,13 @@ pub fn pod_sandbox_config_to_box_config_with_default(
         })?;
 
     let resources = parse_resources(annotations);
+    let network = parse_network(annotations);
     let tee = parse_tee_config(annotations)?;
 
     Ok(BoxConfig {
         image,
         resources,
+        network,
         tee,
         ..Default::default()
     })
@@ -80,6 +84,18 @@ fn parse_resources(annotations: &HashMap<String, String>) -> ResourceConfig {
         disk_mb,
         ..Default::default()
     }
+}
+
+fn parse_network(annotations: &HashMap<String, String>) -> NetworkMode {
+    annotations
+        .get(ANN_NETWORK)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|network| !network.is_empty())
+        .map(|network| NetworkMode::Bridge {
+            network: network.to_string(),
+        })
+        .unwrap_or_default()
 }
 
 /// Parse TEE configuration from annotations.
@@ -184,6 +200,21 @@ mod tests {
 
         assert_eq!(box_config.resources.vcpus, 4);
         assert_eq!(box_config.resources.memory_mb, 2048);
+    }
+
+    #[test]
+    fn test_network_annotation_maps_to_bridge_mode() {
+        let annotations = HashMap::from([
+            (ANN_AGENT_IMAGE.to_string(), "alpine:latest".to_string()),
+            (ANN_NETWORK.to_string(), "k8s-pods".to_string()),
+        ]);
+        let config = make_config(annotations);
+        let box_config = pod_sandbox_config_to_box_config(&config).unwrap();
+
+        assert!(matches!(
+            box_config.network,
+            NetworkMode::Bridge { ref network } if network == "k8s-pods"
+        ));
     }
 
     #[test]
