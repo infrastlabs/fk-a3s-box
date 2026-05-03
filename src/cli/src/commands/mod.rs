@@ -335,6 +335,38 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_images_docker_compat_flags() {
+        let cli =
+            Cli::try_parse_from(["a3s-box", "images", "--all", "--digests", "--no-trunc"]).unwrap();
+
+        let Command::Images(args) = cli.command else {
+            panic!("expected images command");
+        };
+
+        assert!(args.all);
+        assert!(args.digests);
+        assert!(args.no_trunc);
+    }
+
+    #[test]
+    fn test_parse_image_ls_docker_compat_flags() {
+        let cli =
+            Cli::try_parse_from(["a3s-box", "image", "ls", "--all", "--digests", "--no-trunc"])
+                .unwrap();
+
+        let Command::Image(args) = cli.command else {
+            panic!("expected image command");
+        };
+        let image::ImageCommand::Ls(args) = args.command else {
+            panic!("expected image ls command");
+        };
+
+        assert!(args.all);
+        assert!(args.digests);
+        assert!(args.no_trunc);
+    }
+
+    #[test]
     fn test_parse_image_list_alias() {
         let cli = Cli::try_parse_from(["a3s-box", "image", "list"]).unwrap();
 

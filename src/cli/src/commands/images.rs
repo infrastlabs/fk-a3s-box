@@ -8,9 +8,21 @@ use super::images_dir;
 
 #[derive(Args)]
 pub struct ImagesArgs {
+    /// Show all images (accepted for Docker compatibility)
+    #[arg(short, long)]
+    pub all: bool,
+
     /// Only show image references (one per line)
     #[arg(short, long)]
     pub quiet: bool,
+
+    /// Show digests (accepted for Docker compatibility; digests are shown by default)
+    #[arg(long)]
+    pub digests: bool,
+
+    /// Do not truncate digests
+    #[arg(long)]
+    pub no_trunc: bool,
 
     /// Filter output using Docker-style KEY=VALUE filters
     ///
@@ -52,7 +64,10 @@ pub async fn execute(args: ImagesArgs) -> Result<(), Box<dyn std::error::Error>>
     }
 
     // Pre-compute display fields for each image
-    let rows: Vec<ImageRow> = images.iter().map(ImageRow::from_stored).collect();
+    let rows: Vec<ImageRow> = images
+        .iter()
+        .map(|image| ImageRow::from_stored(image, args.no_trunc))
+        .collect();
 
     // --format: custom template output
     if let Some(ref fmt) = args.format {
@@ -249,7 +264,7 @@ struct ImageRow {
 }
 
 impl ImageRow {
-    fn from_stored(image: &a3s_box_runtime::StoredImage) -> Self {
+    fn from_stored(image: &a3s_box_runtime::StoredImage, no_trunc: bool) -> Self {
         let (repository, tag) = match a3s_box_runtime::ImageReference::parse(&image.reference) {
             Ok(r) => {
                 let repo = format!("{}/{}", r.registry, r.repository);
@@ -259,8 +274,9 @@ impl ImageRow {
             Err(_) => (image.reference.clone(), "<none>".to_string()),
         };
 
-        // Format digest: "sha256:" prefix + first 12 hex chars
-        let digest = if let Some(hex) = image.digest.strip_prefix("sha256:") {
+        let digest = if no_trunc {
+            image.digest.clone()
+        } else if let Some(hex) = image.digest.strip_prefix("sha256:") {
             let truncated = if hex.len() > 12 { &hex[..12] } else { hex };
             format!("sha256:{truncated}")
         } else {
@@ -316,7 +332,7 @@ mod tests {
     #[test]
     fn test_from_stored_simple_name() {
         let stored = sample_stored("nginx:1.25", "sha256:abcdef1234567890abcdef", 1024);
-        let row = ImageRow::from_stored(&stored);
+        let row = ImageRow::from_stored(&stored, false);
 
         assert_eq!(row.repository, "docker.io/library/nginx");
         assert_eq!(row.tag, "1.25");
@@ -331,7 +347,7 @@ mod tests {
             "sha256:aabbccdd11223344aabbccdd",
             2048,
         );
-        let row = ImageRow::from_stored(&stored);
+        let row = ImageRow::from_stored(&stored, false);
 
         assert_eq!(row.repository, "ghcr.io/a3s-box/code");
         assert_eq!(row.tag, "v0.1.0");
@@ -341,7 +357,7 @@ mod tests {
     #[test]
     fn test_from_stored_no_tag_defaults_latest() {
         let stored = sample_stored("alpine", "sha256:1234567890ab", 512);
-        let row = ImageRow::from_stored(&stored);
+        let row = ImageRow::from_stored(&stored, false);
 
         assert_eq!(row.repository, "docker.io/library/alpine");
         assert_eq!(row.tag, "latest");
@@ -350,7 +366,7 @@ mod tests {
     #[test]
     fn test_from_stored_digest_short() {
         let stored = sample_stored("nginx:latest", "sha256:abcd", 100);
-        let row = ImageRow::from_stored(&stored);
+        let row = ImageRow::from_stored(&stored, false);
 
         // Short digest should not be truncated
         assert_eq!(row.digest, "sha256:abcd");
@@ -359,7 +375,7 @@ mod tests {
     #[test]
     fn test_from_stored_digest_no_prefix() {
         let stored = sample_stored("nginx:latest", "abcdef1234567890", 100);
-        let row = ImageRow::from_stored(&stored);
+        let row = ImageRow::from_stored(&stored, false);
 
         // Without sha256: prefix, truncate to 12 chars
         assert_eq!(row.digest, "abcdef123456");
@@ -368,16 +384,24 @@ mod tests {
     #[test]
     fn test_from_stored_digest_exactly_12() {
         let stored = sample_stored("nginx:latest", "sha256:abcdef123456", 100);
-        let row = ImageRow::from_stored(&stored);
+        let row = ImageRow::from_stored(&stored, false);
 
         assert_eq!(row.digest, "sha256:abcdef123456");
+    }
+
+    #[test]
+    fn test_from_stored_no_trunc_keeps_full_digest() {
+        let stored = sample_stored("nginx:latest", "sha256:abcdef1234567890", 100);
+        let row = ImageRow::from_stored(&stored, true);
+
+        assert_eq!(row.digest, "sha256:abcdef1234567890");
     }
 
     #[test]
     fn test_from_stored_invalid_reference_fallback() {
         // Empty reference should fail to parse, falling back to raw reference
         let stored = sample_stored("", "sha256:abc", 100);
-        let row = ImageRow::from_stored(&stored);
+        let row = ImageRow::from_stored(&stored, false);
 
         assert_eq!(row.repository, "");
         assert_eq!(row.tag, "<none>");
