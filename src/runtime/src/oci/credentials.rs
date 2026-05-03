@@ -48,7 +48,7 @@ impl CredentialStore {
     pub fn store(&self, registry: &str, username: &str, password: &str) -> Result<()> {
         let mut file = self.load()?;
         file.registries.insert(
-            normalize_registry(registry),
+            a3s_box_core::normalize_registry_server(registry),
             CredentialEntry {
                 username: username.to_string(),
                 password: password.to_string(),
@@ -62,7 +62,7 @@ impl CredentialStore {
         let file = self.load()?;
         Ok(file
             .registries
-            .get(&normalize_registry(registry))
+            .get(&a3s_box_core::normalize_registry_server(registry))
             .map(|e| (e.username.clone(), e.password.clone())))
     }
 
@@ -71,7 +71,7 @@ impl CredentialStore {
         let mut file = self.load()?;
         let removed = file
             .registries
-            .remove(&normalize_registry(registry))
+            .remove(&a3s_box_core::normalize_registry_server(registry))
             .is_some();
         if removed {
             self.save(&file)?;
@@ -138,16 +138,6 @@ impl CredentialStore {
             ))
         })?;
         Ok(())
-    }
-}
-
-/// Normalize registry names (e.g., "docker.io" and "index.docker.io" → "index.docker.io").
-fn normalize_registry(registry: &str) -> String {
-    let r = registry.trim().to_lowercase();
-    if r == "docker.io" || r == "registry-1.docker.io" {
-        "index.docker.io".to_string()
-    } else {
-        r
     }
 }
 

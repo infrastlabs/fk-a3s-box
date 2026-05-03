@@ -915,6 +915,7 @@ fn test_local_state_command_smoke() {
         "coverage",
         "--password",
         "secret",
+        "--skip-verify",
     ]);
     cli.ok(&["logout", "example.invalid"]);
 

@@ -471,6 +471,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_login_skip_verify() {
+        let cli = Cli::try_parse_from([
+            "a3s-box",
+            "login",
+            "registry.example.com",
+            "--username",
+            "alice",
+            "--password-stdin",
+            "--skip-verify",
+        ])
+        .unwrap();
+
+        let Command::Login(args) = cli.command else {
+            panic!("expected login command");
+        };
+
+        assert_eq!(args.server.as_deref(), Some("registry.example.com"));
+        assert_eq!(args.username.as_deref(), Some("alice"));
+        assert!(args.password_stdin);
+        assert!(args.skip_verify);
+    }
+
+    #[test]
     fn test_parse_container_logs_tail_all() {
         let cli =
             Cli::try_parse_from(["a3s-box", "container", "logs", "--tail", "all", "web"]).unwrap();
