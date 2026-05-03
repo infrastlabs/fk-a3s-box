@@ -50,6 +50,7 @@ mod snapshot;
 mod start;
 mod stats;
 mod stop;
+mod system;
 mod system_prune;
 mod top;
 mod unpause;
@@ -178,6 +179,8 @@ pub enum Command {
     Volume(volume::VolumeArgs),
     /// Show disk usage
     Df(df::DfArgs),
+    /// Manage system-wide data
+    System(system::SystemArgs),
     /// Remove all unused data (stopped boxes and unused images)
     SystemPrune(system_prune::SystemPruneArgs),
     /// Show version information
@@ -302,6 +305,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Network(args) => network::execute(args).await,
         Command::Volume(args) => volume::execute(args).await,
         Command::Df(args) => df::execute(args).await,
+        Command::System(args) => system::execute(args).await,
         Command::SystemPrune(args) => system_prune::execute(args).await,
         Command::Version(args) => version::execute(args).await,
         Command::Info(args) => info::execute(args).await,
@@ -429,5 +433,59 @@ mod tests {
         };
 
         assert_eq!(args.r#box, "web");
+    }
+
+    #[test]
+    fn test_parse_system_df_namespace() {
+        let cli = Cli::try_parse_from(["a3s-box", "system", "df", "-v"]).unwrap();
+
+        let Command::System(args) = cli.command else {
+            panic!("expected system command");
+        };
+        let system::SystemCommand::Df(args) = args.command else {
+            panic!("expected system df command");
+        };
+
+        assert!(args.verbose);
+    }
+
+    #[test]
+    fn test_parse_system_prune_namespace() {
+        let cli = Cli::try_parse_from(["a3s-box", "system", "prune", "-a", "-f"]).unwrap();
+
+        let Command::System(args) = cli.command else {
+            panic!("expected system command");
+        };
+        let system::SystemCommand::Prune(args) = args.command else {
+            panic!("expected system prune command");
+        };
+
+        assert!(args.all);
+        assert!(args.force);
+    }
+
+    #[test]
+    fn test_parse_system_info_namespace() {
+        let cli = Cli::try_parse_from(["a3s-box", "system", "info"]).unwrap();
+
+        let Command::System(args) = cli.command else {
+            panic!("expected system command");
+        };
+        assert!(matches!(args.command, system::SystemCommand::Info(_)));
+    }
+
+    #[test]
+    fn test_parse_system_events_namespace() {
+        let cli = Cli::try_parse_from(["a3s-box", "system", "events", "--filter", "event=start"])
+            .unwrap();
+
+        let Command::System(args) = cli.command else {
+            panic!("expected system command");
+        };
+        let system::SystemCommand::Events(args) = args.command else {
+            panic!("expected system events command");
+        };
+
+        assert_eq!(args.filter, vec!["event=start"]);
     }
 }
