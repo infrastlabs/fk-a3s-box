@@ -186,6 +186,8 @@ mod tests {
             annotations: HashMap::new(),
             log_path: String::new(),
             mounts: vec![],
+            devices: vec![],
+            linux: None,
             command: vec!["true".to_string()],
             args: vec![],
             envs: vec![],

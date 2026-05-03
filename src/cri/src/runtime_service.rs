@@ -19,7 +19,10 @@ use a3s_box_runtime::pool::WarmPool;
 use a3s_box_runtime::vm::VmManager;
 
 use crate::config_mapper::pod_sandbox_config_to_box_config_with_defaults;
-use crate::container::{Container, ContainerMount, ContainerState};
+use crate::container::{
+    Container, ContainerDevice, ContainerLinuxConfig, ContainerLinuxResources,
+    ContainerLinuxSecurityContext, ContainerMount, ContainerState,
+};
 use crate::cri_api::runtime_service_server::RuntimeService;
 use crate::cri_api::*;
 use crate::error::box_error_to_status;
@@ -525,6 +528,70 @@ fn container_mount_to_cri(mount: &ContainerMount) -> Mount {
     }
 }
 
+fn container_device_from_cri(device: &Device) -> ContainerDevice {
+    ContainerDevice {
+        container_path: device.container_path.clone(),
+        host_path: device.host_path.clone(),
+        permissions: device.permissions.clone(),
+    }
+}
+
+fn container_linux_from_cri(linux: Option<&LinuxContainerConfig>) -> Option<ContainerLinuxConfig> {
+    let linux = linux?;
+    Some(ContainerLinuxConfig {
+        resources: linux
+            .resources
+            .as_ref()
+            .map(container_linux_resources_from_cri),
+        security_context: linux
+            .security_context
+            .as_ref()
+            .map(container_linux_security_context_from_cri),
+    })
+}
+
+fn container_linux_resources_from_cri(
+    resources: &LinuxContainerResources,
+) -> ContainerLinuxResources {
+    ContainerLinuxResources {
+        cpu_period: resources.cpu_period,
+        cpu_quota: resources.cpu_quota,
+        cpu_shares: resources.cpu_shares,
+        memory_limit_in_bytes: resources.memory_limit_in_bytes,
+        oom_score_adj: resources.oom_score_adj,
+        cpuset_cpus: resources.cpuset_cpus.clone(),
+        cpuset_mems: resources.cpuset_mems.clone(),
+        unified: resources.unified.clone(),
+        memory_swap_limit_in_bytes: resources.memory_swap_limit_in_bytes,
+    }
+}
+
+fn container_linux_security_context_from_cri(
+    security: &LinuxContainerSecurityContext,
+) -> ContainerLinuxSecurityContext {
+    let namespace = security.namespace_options.as_ref();
+    let selinux = security.selinux_options.as_ref();
+
+    ContainerLinuxSecurityContext {
+        namespace_network: namespace.map(|ns| ns.network).unwrap_or_default(),
+        namespace_pid: namespace.map(|ns| ns.pid).unwrap_or_default(),
+        namespace_ipc: namespace.map(|ns| ns.ipc).unwrap_or_default(),
+        namespace_user: namespace.map(|ns| ns.user).unwrap_or_default(),
+        namespace_target_id: namespace.map(|ns| ns.target_id.clone()).unwrap_or_default(),
+        selinux_user: selinux.map(|se| se.user.clone()).unwrap_or_default(),
+        selinux_role: selinux.map(|se| se.role.clone()).unwrap_or_default(),
+        selinux_type: selinux.map(|se| se.r#type.clone()).unwrap_or_default(),
+        selinux_level: selinux.map(|se| se.level.clone()).unwrap_or_default(),
+        run_as_user: security.run_as_user.as_ref().map(|value| value.value),
+        run_as_username: security.run_as_username.clone(),
+        run_as_group: security.run_as_group.as_ref().map(|value| value.value),
+        readonly_rootfs: security.readonly_rootfs,
+        supplemental_groups: security.supplemental_groups.clone(),
+        privileged: security.privileged,
+        no_new_privs: security.no_new_privs,
+    }
+}
+
 #[tonic::async_trait]
 impl RuntimeService for BoxRuntimeService {
     // ── Version ──────────────────────────────────────────────────────
@@ -904,6 +971,12 @@ impl RuntimeService for BoxRuntimeService {
             annotations: config.annotations.clone(),
             log_path: config.log_path,
             mounts: config.mounts.iter().map(container_mount_from_cri).collect(),
+            devices: config
+                .devices
+                .iter()
+                .map(container_device_from_cri)
+                .collect(),
+            linux: container_linux_from_cri(config.linux.as_ref()),
             command,
             args,
             envs,
@@ -1121,6 +1194,14 @@ impl RuntimeService for BoxRuntimeService {
                 (
                     "a3s.mounts".to_string(),
                     serde_json::to_string(&container.mounts).unwrap_or_default(),
+                ),
+                (
+                    "a3s.devices".to_string(),
+                    serde_json::to_string(&container.devices).unwrap_or_default(),
+                ),
+                (
+                    "a3s.linux".to_string(),
+                    serde_json::to_string(&container.linux).unwrap_or_default(),
                 ),
                 (
                     "a3s.working_dir".to_string(),
@@ -1868,6 +1949,8 @@ mod tests {
             annotations: HashMap::new(),
             log_path: String::new(),
             mounts: vec![],
+            devices: vec![],
+            linux: None,
             command: vec!["echo".to_string()],
             args: vec!["hello".to_string()],
             envs: vec![],
@@ -2352,6 +2435,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_container_preserves_devices_and_linux_config() {
+        let svc = make_test_service();
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+
+        let resp = svc
+            .create_container(Request::new(CreateContainerRequest {
+                pod_sandbox_id: "sb-1".to_string(),
+                config: Some(ContainerConfig {
+                    metadata: Some(ContainerMetadata {
+                        name: "my-container".to_string(),
+                        attempt: 0,
+                    }),
+                    image: Some(ImageSpec {
+                        image: "nginx:latest".to_string(),
+                        annotations: HashMap::new(),
+                    }),
+                    command: vec!["echo".to_string()],
+                    devices: vec![Device {
+                        container_path: "/dev/fuse".to_string(),
+                        host_path: "/dev/fuse".to_string(),
+                        permissions: "rwm".to_string(),
+                    }],
+                    linux: Some(LinuxContainerConfig {
+                        resources: Some(LinuxContainerResources {
+                            cpu_period: 100_000,
+                            cpu_quota: 50_000,
+                            cpu_shares: 512,
+                            memory_limit_in_bytes: 128 * 1024 * 1024,
+                            oom_score_adj: 100,
+                            cpuset_cpus: "0".to_string(),
+                            cpuset_mems: String::new(),
+                            hugepage_limits: vec![],
+                            unified: HashMap::from([(
+                                "memory.high".to_string(),
+                                "67108864".to_string(),
+                            )]),
+                            memory_swap_limit_in_bytes: 256 * 1024 * 1024,
+                        }),
+                        security_context: Some(LinuxContainerSecurityContext {
+                            namespace_options: Some(NamespaceOption {
+                                network: 0,
+                                pid: 2,
+                                ipc: 0,
+                                target_id: String::new(),
+                                user: 0,
+                            }),
+                            selinux_options: Some(SeLinuxOption {
+                                user: "system_u".to_string(),
+                                role: "system_r".to_string(),
+                                r#type: "container_t".to_string(),
+                                level: "s0".to_string(),
+                            }),
+                            run_as_user: Some(Int64Value { value: 1000 }),
+                            run_as_username: "app".to_string(),
+                            run_as_group: Some(Int64Value { value: 1000 }),
+                            readonly_rootfs: true,
+                            supplemental_groups: vec![2000],
+                            privileged: true,
+                            no_new_privs: true,
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_config: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let stored = svc.store.containers.get(&resp.container_id).await.unwrap();
+        assert_eq!(stored.devices.len(), 1);
+        assert_eq!(stored.devices[0].container_path, "/dev/fuse");
+
+        let linux = stored.linux.unwrap();
+        assert_eq!(linux.resources.unwrap().cpu_quota, 50_000);
+        let security = linux.security_context.unwrap();
+        assert!(security.privileged);
+        assert_eq!(security.run_as_user, Some(1000));
+        assert_eq!(security.selinux_type, "container_t");
+    }
+
+    #[tokio::test]
     async fn test_create_container_resolves_image_config_defaults() {
         let store_tmp = tempfile::tempdir().unwrap();
         let image_store = Arc::new(ImageStore::new(store_tmp.path(), 100 * 1024 * 1024).unwrap());
@@ -2642,6 +2807,8 @@ mod tests {
         assert_eq!(resp.info.get("a3s.args").unwrap(), r#"["hello"]"#);
         assert_eq!(resp.info.get("a3s.env").unwrap(), r#"["KEY=VALUE"]"#);
         assert!(resp.info.contains_key("a3s.mounts"));
+        assert!(resp.info.contains_key("a3s.devices"));
+        assert!(resp.info.contains_key("a3s.linux"));
         assert_eq!(resp.info.get("a3s.working_dir").unwrap(), "/workspace");
         assert_eq!(resp.info.get("a3s.tty").unwrap(), "true");
     }

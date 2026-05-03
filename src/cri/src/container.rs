@@ -36,6 +36,61 @@ pub struct ContainerMount {
     pub propagation: i32,
 }
 
+/// CRI device captured from ContainerConfig.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerDevice {
+    /// Path inside the container/session.
+    pub container_path: String,
+    /// Host path backing the device.
+    pub host_path: String,
+    /// Device permissions string.
+    pub permissions: String,
+}
+
+/// Linux resources captured from CRI ContainerConfig.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerLinuxResources {
+    pub cpu_period: i64,
+    pub cpu_quota: i64,
+    pub cpu_shares: i64,
+    pub memory_limit_in_bytes: i64,
+    pub oom_score_adj: i64,
+    pub cpuset_cpus: String,
+    pub cpuset_mems: String,
+    pub unified: HashMap<String, String>,
+    pub memory_swap_limit_in_bytes: i64,
+}
+
+/// Linux security context captured from CRI ContainerConfig.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerLinuxSecurityContext {
+    pub namespace_network: i32,
+    pub namespace_pid: i32,
+    pub namespace_ipc: i32,
+    pub namespace_user: i32,
+    pub namespace_target_id: String,
+    pub selinux_user: String,
+    pub selinux_role: String,
+    pub selinux_type: String,
+    pub selinux_level: String,
+    pub run_as_user: Option<i64>,
+    pub run_as_username: String,
+    pub run_as_group: Option<i64>,
+    pub readonly_rootfs: bool,
+    pub supplemental_groups: Vec<i64>,
+    pub privileged: bool,
+    pub no_new_privs: bool,
+}
+
+/// Linux config captured from CRI ContainerConfig.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerLinuxConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ContainerLinuxResources>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_context: Option<ContainerLinuxSecurityContext>,
+}
+
 /// Represents a container (session) within a pod sandbox (Box).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Container {
@@ -66,6 +121,12 @@ pub struct Container {
     /// Mounts captured from CRI ContainerConfig.
     #[serde(default)]
     pub mounts: Vec<ContainerMount>,
+    /// Devices captured from CRI ContainerConfig.
+    #[serde(default)]
+    pub devices: Vec<ContainerDevice>,
+    /// Linux config captured from CRI ContainerConfig.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux: Option<ContainerLinuxConfig>,
     /// Entrypoint command captured from CRI ContainerConfig.
     #[serde(default)]
     pub command: Vec<String>,
@@ -234,6 +295,8 @@ mod tests {
             annotations: HashMap::new(),
             log_path: format!("/var/log/pods/{}.log", id),
             mounts: vec![],
+            devices: vec![],
+            linux: None,
             command: vec!["echo".to_string()],
             args: vec!["hello".to_string()],
             envs: vec![("KEY".to_string(), "VALUE".to_string())],
@@ -276,6 +339,8 @@ mod tests {
 
         assert!(container.command.is_empty());
         assert!(container.mounts.is_empty());
+        assert!(container.devices.is_empty());
+        assert!(container.linux.is_none());
         assert!(container.args.is_empty());
         assert!(container.envs.is_empty());
         assert_eq!(container.working_dir, None);
