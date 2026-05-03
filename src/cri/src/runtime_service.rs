@@ -460,6 +460,8 @@ impl RuntimeService for BoxRuntimeService {
 
         tracing::info!(sandbox_id = %sandbox_id, "CRI StopPodSandbox");
 
+        let sandbox = self.store.sandboxes.get(sandbox_id).await;
+
         // Stop all containers in this sandbox
         let containers = self.store.containers.list(Some(sandbox_id), None).await;
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -477,6 +479,15 @@ impl RuntimeService for BoxRuntimeService {
         self.store
             .update_sandbox_state(sandbox_id, SandboxState::NotReady)
             .await;
+
+        if let Some(sandbox) = sandbox {
+            if let Some(network_name) = sandbox.network_name.as_deref() {
+                disconnect_cri_network_endpoint(network_name, sandbox_id);
+                self.store
+                    .update_sandbox_network(sandbox_id, sandbox.network_name.clone(), None)
+                    .await;
+            }
+        }
 
         Ok(Response::new(StopPodSandboxResponse {}))
     }
@@ -2527,6 +2538,26 @@ mod tests {
         // Container should be Exited
         let c = svc.store.containers.get("c-1").await.unwrap();
         assert_eq!(c.state, ContainerState::Exited);
+    }
+
+    #[tokio::test]
+    async fn test_stop_pod_sandbox_clears_network_ip() {
+        let svc = make_test_service();
+        let mut sandbox = test_sandbox("sb-1");
+        sandbox.network_name = Some("k8s-pods".to_string());
+        sandbox.ip_address = Some("10.88.0.2".to_string());
+        svc.store.sandboxes.add(sandbox).await;
+
+        svc.stop_pod_sandbox(Request::new(StopPodSandboxRequest {
+            pod_sandbox_id: "sb-1".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        let sb = svc.store.sandboxes.get("sb-1").await.unwrap();
+        assert_eq!(sb.state, SandboxState::NotReady);
+        assert_eq!(sb.network_name.as_deref(), Some("k8s-pods"));
+        assert!(sb.ip_address.is_none());
     }
 
     #[tokio::test]
