@@ -46,6 +46,41 @@ pub struct Container {
     pub annotations: HashMap<String, String>,
     /// Log file path.
     pub log_path: String,
+    /// Entrypoint command captured from CRI ContainerConfig.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Arguments captured from CRI ContainerConfig.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables captured from CRI ContainerConfig.
+    #[serde(default)]
+    pub envs: Vec<(String, String)>,
+    /// Working directory captured from CRI ContainerConfig.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Whether stdin was requested.
+    #[serde(default)]
+    pub stdin: bool,
+    /// Whether TTY was requested.
+    #[serde(default)]
+    pub tty: bool,
+}
+
+impl Container {
+    /// Return the command line that can be executed inside the sandbox VM.
+    pub fn session_command(&self) -> Vec<String> {
+        let mut cmd = self.command.clone();
+        cmd.extend(self.args.iter().cloned());
+        cmd
+    }
+
+    /// Return environment variables in guest exec format.
+    pub fn exec_env(&self) -> Vec<String> {
+        self.envs
+            .iter()
+            .map(|(key, value)| format!("{}={}", key, value))
+            .collect()
+    }
 }
 
 /// In-memory store for containers.
@@ -178,6 +213,12 @@ mod tests {
             labels: HashMap::from([("app".to_string(), "test".to_string())]),
             annotations: HashMap::new(),
             log_path: format!("/var/log/pods/{}.log", id),
+            command: vec!["echo".to_string()],
+            args: vec!["hello".to_string()],
+            envs: vec![("KEY".to_string(), "VALUE".to_string())],
+            working_dir: Some("/workspace".to_string()),
+            stdin: false,
+            tty: false,
         }
     }
 
@@ -189,6 +230,35 @@ mod tests {
         let c = store.get("c1").await.unwrap();
         assert_eq!(c.name, "container-c1");
         assert_eq!(c.state, ContainerState::Created);
+        assert_eq!(c.session_command(), vec!["echo", "hello"]);
+        assert_eq!(c.exec_env(), vec!["KEY=VALUE"]);
+    }
+
+    #[test]
+    fn test_deserialize_legacy_container_defaults_session_fields() {
+        let json = r#"{
+            "id": "c1",
+            "sandbox_id": "sb1",
+            "name": "container-c1",
+            "image_ref": "nginx:latest",
+            "state": "Created",
+            "created_at": 1000000000,
+            "started_at": 0,
+            "finished_at": 0,
+            "exit_code": 0,
+            "labels": {},
+            "annotations": {},
+            "log_path": "/var/log/pods/c1.log"
+        }"#;
+
+        let container: Container = serde_json::from_str(json).unwrap();
+
+        assert!(container.command.is_empty());
+        assert!(container.args.is_empty());
+        assert!(container.envs.is_empty());
+        assert_eq!(container.working_dir, None);
+        assert!(!container.stdin);
+        assert!(!container.tty);
     }
 
     #[tokio::test]

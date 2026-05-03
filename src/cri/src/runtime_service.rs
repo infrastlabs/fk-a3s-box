@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 use a3s_box_core::event::EventEmitter;
-use a3s_box_runtime::oci::{ImageStore, RegistryAuth};
+use a3s_box_runtime::oci::{ImageStore, OciImage, OciImageConfig, RegistryAuth};
 use a3s_box_runtime::pool::WarmPool;
 use a3s_box_runtime::vm::VmManager;
 
@@ -30,6 +30,8 @@ use crate::streaming::{SessionKind, StreamingHandle, StreamingSession};
 /// A3S Box implementation of the CRI RuntimeService.
 pub struct BoxRuntimeService {
     store: Arc<PersistentCriStore>,
+    /// Local OCI image store used for resolving image config defaults.
+    image_store: Arc<ImageStore>,
     /// Maps sandbox_id → VmManager for running VMs.
     vm_managers: Arc<RwLock<HashMap<String, VmManager>>>,
     /// Handle for registering CRI streaming sessions.
@@ -41,23 +43,39 @@ pub struct BoxRuntimeService {
 impl BoxRuntimeService {
     /// Create a new BoxRuntimeService with JSON-backed persistent state.
     pub fn new(
-        _image_store: Arc<ImageStore>,
+        image_store: Arc<ImageStore>,
         _auth: RegistryAuth,
         streaming: StreamingHandle,
     ) -> Self {
         let state_store: Arc<dyn StateStore> = Arc::new(JsonStateStore::new(default_state_path()));
-        Self::with_state_store(_image_store, _auth, streaming, state_store)
+        Self::with_state_store(image_store, _auth, streaming, state_store)
     }
 
     /// Create a BoxRuntimeService with a custom StateStore (used in tests).
     pub fn with_state_store(
-        _image_store: Arc<ImageStore>,
+        image_store: Arc<ImageStore>,
         _auth: RegistryAuth,
         streaming: StreamingHandle,
         state_store: Arc<dyn StateStore>,
     ) -> Self {
+        Self::with_persistent_store(
+            image_store,
+            _auth,
+            streaming,
+            Arc::new(PersistentCriStore::new(state_store)),
+        )
+    }
+
+    /// Create a BoxRuntimeService with a shared persistent CRI store.
+    pub fn with_persistent_store(
+        image_store: Arc<ImageStore>,
+        _auth: RegistryAuth,
+        streaming: StreamingHandle,
+        store: Arc<PersistentCriStore>,
+    ) -> Self {
         Self {
-            store: Arc::new(PersistentCriStore::new(state_store)),
+            store,
+            image_store,
             vm_managers: Arc::new(RwLock::new(HashMap::new())),
             streaming,
             warm_pool: None,
@@ -74,6 +92,47 @@ impl BoxRuntimeService {
     pub async fn load_state(&self) {
         if let Err(e) = self.store.load().await {
             tracing::warn!(error = %e, "Failed to load persisted CRI state — starting fresh");
+            return;
+        }
+
+        self.reconcile_loaded_state().await;
+    }
+
+    /// Reconcile persisted state after a CRI process restart.
+    ///
+    /// VmManager instances are in-memory only. After restart there are no
+    /// manageable VMs, so persisted Ready/Running records must not advertise
+    /// live workloads to kubelet.
+    async fn reconcile_loaded_state(&self) {
+        let ready_sandboxes = self
+            .store
+            .sandboxes
+            .list(None)
+            .await
+            .into_iter()
+            .filter(|sandbox| sandbox.state == SandboxState::Ready)
+            .map(|sandbox| sandbox.id)
+            .collect::<Vec<_>>();
+        for sandbox_id in ready_sandboxes {
+            self.store
+                .update_sandbox_state(&sandbox_id, SandboxState::NotReady)
+                .await;
+        }
+
+        let finished_at = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let running_containers = self
+            .store
+            .containers
+            .list(None, None)
+            .await
+            .into_iter()
+            .filter(|container| container.state == ContainerState::Running)
+            .map(|container| container.id)
+            .collect::<Vec<_>>();
+        for container_id in running_containers {
+            self.store
+                .mark_container_exited(&container_id, finished_at, 255)
+                .await;
         }
     }
 
@@ -100,6 +159,20 @@ impl BoxRuntimeService {
         let mut vm = VmManager::new(box_config, event_emitter);
         vm.boot().await.map_err(box_error_to_status)?;
         Ok(vm)
+    }
+
+    /// Load OCI image configuration from the local image store.
+    async fn image_config(&self, image_ref: &str) -> Result<Option<OciImageConfig>, Status> {
+        if image_ref.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(stored) = self.image_store.find(image_ref).await else {
+            return Ok(None);
+        };
+
+        let image = OciImage::from_path(&stored.path).map_err(box_error_to_status)?;
+        Ok(Some(image.config().clone()))
     }
 
     /// Release a VM back to the warm pool, or destroy it if no pool.
@@ -376,6 +449,71 @@ impl RuntimeService for BoxRuntimeService {
             .as_ref()
             .map(|i| i.image.clone())
             .unwrap_or_default();
+        let image_config = match self.image_config(&image_ref).await {
+            Ok(config) => config,
+            Err(status) if config.command.is_empty() => return Err(status),
+            Err(status) => {
+                tracing::warn!(
+                    image = %image_ref,
+                    error = %status,
+                    "Failed to load image config; using explicit CRI container config only"
+                );
+                None
+            }
+        };
+        let image_missing = !image_ref.is_empty() && image_config.is_none();
+
+        let mut command = config.command.clone();
+        let mut args = config.args.clone();
+        if let Some(image_config) = &image_config {
+            if command.is_empty() {
+                if let Some(entrypoint) = &image_config.entrypoint {
+                    command = entrypoint.clone();
+                }
+            }
+            if args.is_empty() {
+                if let Some(cmd) = &image_config.cmd {
+                    if command.is_empty() {
+                        command = cmd.clone();
+                    } else {
+                        args = cmd.clone();
+                    }
+                }
+            }
+        }
+
+        if command.is_empty() && !args.is_empty() {
+            command = std::mem::take(&mut args);
+        }
+        if command.is_empty() {
+            if image_missing {
+                return Err(Status::not_found(format!(
+                    "Image {} not found in local store and no explicit command was provided",
+                    image_ref
+                )));
+            }
+            return Err(Status::invalid_argument(
+                "no command specified: provide CRI command or use an image with Entrypoint/Cmd",
+            ));
+        }
+
+        let mut envs = image_config
+            .as_ref()
+            .map(|c| c.env.clone())
+            .unwrap_or_default();
+        for kv in &config.envs {
+            if let Some(existing) = envs.iter_mut().find(|(key, _)| key == &kv.key) {
+                existing.1.clone_from(&kv.value);
+            } else {
+                envs.push((kv.key.clone(), kv.value.clone()));
+            }
+        }
+
+        let working_dir = if !config.working_dir.is_empty() {
+            Some(config.working_dir.clone())
+        } else {
+            image_config.as_ref().and_then(|c| c.working_dir.clone())
+        };
 
         tracing::info!(
             sandbox_id = %sandbox_id,
@@ -400,6 +538,12 @@ impl RuntimeService for BoxRuntimeService {
             labels: config.labels.clone(),
             annotations: config.annotations.clone(),
             log_path: config.log_path,
+            command,
+            args,
+            envs,
+            working_dir,
+            stdin: config.stdin,
+            tty: config.tty,
         };
 
         self.store.add_container(container).await;
@@ -427,10 +571,66 @@ impl RuntimeService for BoxRuntimeService {
             "CRI StartContainer"
         );
 
-        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        if container.state != ContainerState::Created {
+            return Err(Status::failed_precondition(format!(
+                "Container {} is not in Created state",
+                container_id
+            )));
+        }
+
+        if container.command.is_empty() {
+            return Err(Status::invalid_argument(
+                "a3s-box CRI session containers require an explicit command; image entrypoint resolution for secondary containers is not implemented",
+            ));
+        }
+        let cmd = container.session_command();
+
+        // Get the VmManager for this sandbox and execute the configured command.
+        let managers = self.vm_managers.read().await;
+        let vm = managers.get(&container.sandbox_id).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "Sandbox {} is not running (VM not found)",
+                container.sandbox_id
+            ))
+        })?;
+
+        let started_at = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         self.store
-            .mark_container_started(container_id, now_ns)
+            .mark_container_started(container_id, started_at)
             .await;
+
+        let request = a3s_box_core::exec::ExecRequest {
+            cmd,
+            timeout_ns: a3s_box_core::exec::DEFAULT_EXEC_TIMEOUT_NS,
+            env: container.exec_env(),
+            working_dir: container.working_dir.clone(),
+            stdin: None,
+            user: None,
+            streaming: false,
+        };
+
+        let output = match vm.exec_request(request).await {
+            Ok(output) => output,
+            Err(error) => {
+                let finished_at = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                self.store
+                    .mark_container_exited(container_id, finished_at, 127)
+                    .await;
+                return Err(box_error_to_status(error));
+            }
+        };
+
+        let finished_at = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        self.store
+            .mark_container_exited(container_id, finished_at, output.exit_code)
+            .await;
+
+        if output.exit_code != 0 {
+            return Err(Status::unknown(format!(
+                "Container {} exited with code {}",
+                container_id, output.exit_code
+            )));
+        }
 
         Ok(Response::new(StartContainerResponse {}))
     }
@@ -443,6 +643,17 @@ impl RuntimeService for BoxRuntimeService {
         let container_id = &req.container_id;
 
         tracing::info!(container_id = %container_id, "CRI StopContainer");
+
+        let container = self
+            .store
+            .containers
+            .get(container_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
+
+        if container.state != ContainerState::Running {
+            return Ok(Response::new(StopContainerResponse {}));
+        }
 
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         self.store
@@ -460,6 +671,20 @@ impl RuntimeService for BoxRuntimeService {
         let container_id = &req.container_id;
 
         tracing::info!(container_id = %container_id, "CRI RemoveContainer");
+
+        let container = self
+            .store
+            .containers
+            .get(container_id)
+            .await
+            .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
+
+        if container.state == ContainerState::Running {
+            return Err(Status::failed_precondition(format!(
+                "Container {} is running; stop it before removal",
+                container_id
+            )));
+        }
 
         self.store.remove_container(container_id).await;
 
@@ -509,10 +734,34 @@ impl RuntimeService for BoxRuntimeService {
             mounts: vec![],
             log_path: container.log_path.clone(),
         };
+        let info = if req.verbose {
+            HashMap::from([
+                (
+                    "a3s.command".to_string(),
+                    serde_json::to_string(&container.command).unwrap_or_default(),
+                ),
+                (
+                    "a3s.args".to_string(),
+                    serde_json::to_string(&container.args).unwrap_or_default(),
+                ),
+                (
+                    "a3s.env".to_string(),
+                    serde_json::to_string(&container.exec_env()).unwrap_or_default(),
+                ),
+                (
+                    "a3s.working_dir".to_string(),
+                    container.working_dir.clone().unwrap_or_default(),
+                ),
+                ("a3s.stdin".to_string(), container.stdin.to_string()),
+                ("a3s.tty".to_string(), container.tty.to_string()),
+            ])
+        } else {
+            Default::default()
+        };
 
         Ok(Response::new(ContainerStatusResponse {
             status: Some(status),
-            info: Default::default(),
+            info,
         }))
     }
 
@@ -982,23 +1231,118 @@ impl RuntimeService for BoxRuntimeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::net::SocketAddr;
+    use std::path::Path;
 
     use crate::streaming::StreamingServer;
 
     /// Create a BoxRuntimeService for testing.
     /// Uses NoopStateStore (no disk I/O) and a dummy StreamingHandle.
     fn make_test_service() -> BoxRuntimeService {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_store = Arc::new(ImageStore::new(tmp.path(), 100 * 1024 * 1024).unwrap());
+        make_test_service_with_image_store(image_store)
+    }
+
+    fn make_test_service_with_image_store(image_store: Arc<ImageStore>) -> BoxRuntimeService {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let streaming_server = StreamingServer::new(addr);
         let handle = streaming_server.handle();
 
         BoxRuntimeService {
             store: Arc::new(PersistentCriStore::new(Arc::new(NoopStateStore))),
+            image_store,
             vm_managers: Arc::new(RwLock::new(HashMap::new())),
             streaming: handle,
             warm_pool: None,
         }
+    }
+
+    fn make_test_service_with_state_store(state_store: Arc<dyn StateStore>) -> BoxRuntimeService {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_store = Arc::new(ImageStore::new(tmp.path(), 100 * 1024 * 1024).unwrap());
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let streaming_server = StreamingServer::new(addr);
+        let handle = streaming_server.handle();
+
+        BoxRuntimeService::with_state_store(
+            image_store,
+            RegistryAuth::anonymous(),
+            handle,
+            state_store,
+        )
+    }
+
+    fn create_test_oci_image(path: &Path) {
+        fs::create_dir_all(path.join("blobs/sha256")).unwrap();
+        fs::write(path.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+
+        let config_content = r#"{
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {
+                "Entrypoint": ["/bin/server"],
+                "Cmd": ["--listen", "8080"],
+                "Env": ["PATH=/usr/bin:/bin", "A3S_IMAGE=1"],
+                "WorkingDir": "/srv/app"
+            },
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": ["sha256:layer1hash"]
+            },
+            "history": []
+        }"#;
+        let config_hash = "configabc123";
+        fs::write(path.join("blobs/sha256").join(config_hash), config_content).unwrap();
+
+        let layer_hash = "layerdef456";
+        fs::write(path.join("blobs/sha256").join(layer_hash), b"test layer").unwrap();
+
+        let manifest_content = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {{
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "sha256:{}",
+                    "size": {}
+                }},
+                "layers": [
+                    {{
+                        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                        "digest": "sha256:{}",
+                        "size": 10
+                    }}
+                ]
+            }}"#,
+            config_hash,
+            config_content.len(),
+            layer_hash
+        );
+        let manifest_hash = "manifestxyz789";
+        fs::write(
+            path.join("blobs/sha256").join(manifest_hash),
+            &manifest_content,
+        )
+        .unwrap();
+
+        let index_content = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [
+                    {{
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": "sha256:{}",
+                        "size": {}
+                    }}
+                ]
+            }}"#,
+            manifest_hash,
+            manifest_content.len()
+        );
+        fs::write(path.join("index.json"), index_content).unwrap();
     }
 
     fn test_sandbox(id: &str) -> PodSandbox {
@@ -1030,6 +1374,12 @@ mod tests {
             labels: HashMap::from([("app".to_string(), "test".to_string())]),
             annotations: HashMap::new(),
             log_path: String::new(),
+            command: vec!["echo".to_string()],
+            args: vec!["hello".to_string()],
+            envs: vec![],
+            working_dir: None,
+            stdin: false,
+            tty: false,
         }
     }
 
@@ -1049,6 +1399,29 @@ mod tests {
         assert_eq!(resp.runtime_name, "a3s-box");
         assert_eq!(resp.runtime_api_version, "v1");
         assert!(!resp.runtime_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_state_reconciles_stale_running_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state_store: Arc<dyn StateStore> = Arc::new(JsonStateStore::new(&path));
+
+        let svc = make_test_service_with_state_store(state_store.clone());
+        svc.store.add_sandbox(test_sandbox("sb-1")).await;
+        svc.store.add_container(test_container("c-1", "sb-1")).await;
+        svc.store.mark_container_started("c-1", 2_000_000_000).await;
+
+        let reloaded = make_test_service_with_state_store(state_store);
+        reloaded.load_state().await;
+
+        let sandbox = reloaded.store.sandboxes.get("sb-1").await.unwrap();
+        assert_eq!(sandbox.state, SandboxState::NotReady);
+
+        let container = reloaded.store.containers.get("c-1").await.unwrap();
+        assert_eq!(container.state, ContainerState::Exited);
+        assert_eq!(container.exit_code, 255);
+        assert!(container.finished_at > 0);
     }
 
     // ── Status ───────────────────────────────────────────────────────
@@ -1187,6 +1560,13 @@ mod tests {
                         image: "nginx:latest".to_string(),
                         annotations: HashMap::new(),
                     }),
+                    command: vec!["echo".to_string()],
+                    args: vec!["hello".to_string()],
+                    envs: vec![KeyValue {
+                        key: "A3S_TEST".to_string(),
+                        value: "1".to_string(),
+                    }],
+                    working_dir: "/workspace".to_string(),
                     ..Default::default()
                 }),
                 sandbox_config: None,
@@ -1232,6 +1612,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_container_missing_image_without_command() {
+        let svc = make_test_service();
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+
+        let result = svc
+            .create_container(Request::new(CreateContainerRequest {
+                pod_sandbox_id: "sb-1".to_string(),
+                config: Some(ContainerConfig {
+                    metadata: Some(ContainerMetadata {
+                        name: "my-container".to_string(),
+                        attempt: 0,
+                    }),
+                    image: Some(ImageSpec {
+                        image: "missing:latest".to_string(),
+                        annotations: HashMap::new(),
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_config: None,
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
     async fn test_create_container_success() {
         let svc = make_test_service();
         svc.store.sandboxes.add(test_sandbox("sb-1")).await;
@@ -1248,6 +1655,13 @@ mod tests {
                         image: "nginx:latest".to_string(),
                         annotations: HashMap::new(),
                     }),
+                    command: vec!["echo".to_string()],
+                    args: vec!["hello".to_string()],
+                    envs: vec![KeyValue {
+                        key: "A3S_TEST".to_string(),
+                        value: "1".to_string(),
+                    }],
+                    working_dir: "/workspace".to_string(),
                     ..Default::default()
                 }),
                 sandbox_config: None,
@@ -1263,6 +1677,68 @@ mod tests {
         assert_eq!(c.name, "my-container");
         assert_eq!(c.sandbox_id, "sb-1");
         assert_eq!(c.state, ContainerState::Created);
+        assert_eq!(c.session_command(), vec!["echo", "hello"]);
+        assert_eq!(c.envs, vec![("A3S_TEST".to_string(), "1".to_string())]);
+        assert_eq!(c.working_dir.as_deref(), Some("/workspace"));
+    }
+
+    #[tokio::test]
+    async fn test_create_container_resolves_image_config_defaults() {
+        let store_tmp = tempfile::tempdir().unwrap();
+        let image_store = Arc::new(ImageStore::new(store_tmp.path(), 100 * 1024 * 1024).unwrap());
+        let image_tmp = tempfile::tempdir().unwrap();
+        create_test_oci_image(image_tmp.path());
+        image_store
+            .put("nginx:latest", "sha256:testimage001", image_tmp.path())
+            .await
+            .unwrap();
+
+        let svc = make_test_service_with_image_store(image_store);
+        svc.store.sandboxes.add(test_sandbox("sb-1")).await;
+
+        let resp = svc
+            .create_container(Request::new(CreateContainerRequest {
+                pod_sandbox_id: "sb-1".to_string(),
+                config: Some(ContainerConfig {
+                    metadata: Some(ContainerMetadata {
+                        name: "my-container".to_string(),
+                        attempt: 0,
+                    }),
+                    image: Some(ImageSpec {
+                        image: "nginx:latest".to_string(),
+                        annotations: HashMap::new(),
+                    }),
+                    envs: vec![
+                        KeyValue {
+                            key: "PATH".to_string(),
+                            value: "/custom/bin".to_string(),
+                        },
+                        KeyValue {
+                            key: "A3S_CRI".to_string(),
+                            value: "1".to_string(),
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                sandbox_config: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let c = svc.store.containers.get(&resp.container_id).await.unwrap();
+        assert_eq!(c.command, vec!["/bin/server"]);
+        assert_eq!(c.args, vec!["--listen", "8080"]);
+        assert_eq!(c.session_command(), vec!["/bin/server", "--listen", "8080"]);
+        assert_eq!(c.working_dir.as_deref(), Some("/srv/app"));
+        assert_eq!(
+            c.envs,
+            vec![
+                ("PATH".to_string(), "/custom/bin".to_string()),
+                ("A3S_IMAGE".to_string(), "1".to_string()),
+                ("A3S_CRI".to_string(), "1".to_string())
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1278,22 +1754,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_container_success() {
+    async fn test_start_container_missing_vm() {
         let svc = make_test_service();
         svc.store
             .containers
             .add(test_container("c-1", "sb-1"))
             .await;
 
-        svc.start_container(Request::new(StartContainerRequest {
-            container_id: "c-1".to_string(),
-        }))
-        .await
-        .unwrap();
+        let result = svc
+            .start_container(Request::new(StartContainerRequest {
+                container_id: "c-1".to_string(),
+            }))
+            .await;
 
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
         let c = svc.store.containers.get("c-1").await.unwrap();
-        assert_eq!(c.state, ContainerState::Running);
-        assert!(c.started_at > 0);
+        assert_eq!(c.state, ContainerState::Created);
+        assert_eq!(c.started_at, 0);
+    }
+
+    #[tokio::test]
+    async fn test_start_container_requires_explicit_command() {
+        let svc = make_test_service();
+        let mut container = test_container("c-1", "sb-1");
+        container.command.clear();
+        svc.store.containers.add(container).await;
+
+        let result = svc
+            .start_container(Request::new(StartContainerRequest {
+                container_id: "c-1".to_string(),
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -1322,6 +1817,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stop_container_not_found() {
+        let svc = make_test_service();
+
+        let result = svc
+            .stop_container(Request::new(StopContainerRequest {
+                container_id: "missing".to_string(),
+                timeout: 0,
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_stop_container_already_exited_is_noop() {
+        let svc = make_test_service();
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
+        svc.store
+            .containers
+            .mark_exited("c-1", 3_000_000_000, 7)
+            .await;
+
+        svc.stop_container(Request::new(StopContainerRequest {
+            container_id: "c-1".to_string(),
+            timeout: 0,
+        }))
+        .await
+        .unwrap();
+
+        let c = svc.store.containers.get("c-1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Exited);
+        assert_eq!(c.finished_at, 3_000_000_000);
+        assert_eq!(c.exit_code, 7);
+    }
+
+    #[tokio::test]
     async fn test_remove_container() {
         let svc = make_test_service();
         svc.store
@@ -1336,6 +1871,43 @@ mod tests {
         .unwrap();
 
         assert!(svc.store.containers.get("c-1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_container_not_found() {
+        let svc = make_test_service();
+
+        let result = svc
+            .remove_container(Request::new(RemoveContainerRequest {
+                container_id: "missing".to_string(),
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_remove_running_container_rejected() {
+        let svc = make_test_service();
+        svc.store
+            .containers
+            .add(test_container("c-1", "sb-1"))
+            .await;
+        svc.store
+            .containers
+            .mark_started("c-1", 2_000_000_000)
+            .await;
+
+        let result = svc
+            .remove_container(Request::new(RemoveContainerRequest {
+                container_id: "c-1".to_string(),
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        assert!(svc.store.containers.get("c-1").await.is_some());
     }
 
     // ── Container Status ─────────────────────────────────────────────
@@ -1377,6 +1949,31 @@ mod tests {
             crate::cri_api::ContainerState::ContainerCreated
         );
         assert_eq!(status.image_ref, "nginx:latest");
+    }
+
+    #[tokio::test]
+    async fn test_container_status_verbose_info() {
+        let svc = make_test_service();
+        let mut container = test_container("c-1", "sb-1");
+        container.envs = vec![("KEY".to_string(), "VALUE".to_string())];
+        container.working_dir = Some("/workspace".to_string());
+        container.tty = true;
+        svc.store.containers.add(container).await;
+
+        let resp = svc
+            .container_status(Request::new(ContainerStatusRequest {
+                container_id: "c-1".to_string(),
+                verbose: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(resp.info.get("a3s.command").unwrap(), r#"["echo"]"#);
+        assert_eq!(resp.info.get("a3s.args").unwrap(), r#"["hello"]"#);
+        assert_eq!(resp.info.get("a3s.env").unwrap(), r#"["KEY=VALUE"]"#);
+        assert_eq!(resp.info.get("a3s.working_dir").unwrap(), "/workspace");
+        assert_eq!(resp.info.get("a3s.tty").unwrap(), "true");
     }
 
     #[tokio::test]
@@ -1755,6 +2352,10 @@ mod tests {
 
             let svc = BoxRuntimeService {
                 store: Arc::new(PersistentCriStore::new(Arc::new(NoopStateStore))),
+                image_store: Arc::new(
+                    ImageStore::new(&tempfile::tempdir().unwrap().path().join("images"), 1024)
+                        .unwrap(),
+                ),
                 vm_managers: Arc::new(RwLock::new(HashMap::new())),
                 streaming: handle,
                 warm_pool: None,

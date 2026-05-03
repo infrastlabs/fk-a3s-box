@@ -16,7 +16,9 @@ use a3s_box_runtime::oci::{ImageStore, RegistryAuth};
 use crate::cri_api::image_service_server::ImageServiceServer;
 use crate::cri_api::runtime_service_server::RuntimeServiceServer;
 use crate::image_service::BoxImageService;
+use crate::persistent_store::PersistentCriStore;
 use crate::runtime_service::BoxRuntimeService;
+use crate::state::{default_state_path, JsonStateStore, StateStore};
 use crate::streaming::StreamingServer;
 
 /// CRI gRPC server configuration.
@@ -73,13 +75,18 @@ impl CriServer {
             }
         });
 
-        let runtime_service = BoxRuntimeService::new(
+        let state_store: Arc<dyn StateStore> = Arc::new(JsonStateStore::new(default_state_path()));
+        let cri_store = Arc::new(PersistentCriStore::new(state_store));
+
+        let runtime_service = BoxRuntimeService::with_persistent_store(
             self.image_store.clone(),
             self.auth.clone(),
             streaming_handle,
+            cri_store.clone(),
         );
         runtime_service.load_state().await;
-        let image_service = BoxImageService::new(self.image_store.clone(), self.auth.clone());
+        let image_service = BoxImageService::new(self.image_store.clone(), self.auth.clone())
+            .with_cri_store(cri_store);
 
         let uds = UnixListener::bind(&self.socket_path)?;
         let uds_stream = UnixListenerStream::new(uds);

@@ -127,6 +127,12 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             log_path: String::new(),
+            command: vec!["true".to_string()],
+            args: vec![],
+            envs: vec![],
+            working_dir: None,
+            stdin: false,
+            tty: false,
         }
     }
 

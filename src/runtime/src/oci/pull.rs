@@ -56,22 +56,13 @@ impl ImagePuller {
     /// Returns the loaded OCI image from the store.
     pub async fn pull(&self, reference: &str) -> Result<OciImage> {
         let parsed = ImageReference::parse(reference)?;
-        let full_ref = parsed.full_reference();
 
         // Check cache first
-        if let Some(stored) = self.store.get(reference).await {
+        if let Some(stored) = self.store.find(reference).await {
             tracing::info!(
                 reference = %reference,
                 digest = %stored.digest,
-                "Using cached image by requested reference"
-            );
-            return OciImage::from_path(&stored.path);
-        }
-
-        if let Some(stored) = self.store.get(&full_ref).await {
-            tracing::info!(
-                reference = %full_ref,
-                digest = %stored.digest,
+                stored_reference = %stored.reference,
                 "Using cached image"
             );
             return OciImage::from_path(&stored.path);
@@ -86,8 +77,8 @@ impl ImagePuller {
 
         // Remove from cache if present
         let full_ref = parsed.full_reference();
-        if self.store.get(&full_ref).await.is_some() {
-            let _ = self.store.remove(&full_ref).await;
+        if self.store.find(&full_ref).await.is_some() {
+            let _ = self.store.remove_resolved(&full_ref).await;
         }
 
         self.pull_and_store(&parsed).await
@@ -99,15 +90,15 @@ impl ImagePuller {
             Ok(p) => p,
             Err(_) => return false,
         };
-        self.store.get(&parsed.full_reference()).await.is_some()
+        self.store.find(&parsed.full_reference()).await.is_some()
     }
 
     /// Remove a cached image by reference.
     pub async fn remove_cached(&self, reference: &str) -> Result<bool> {
         let parsed = ImageReference::parse(reference)?;
         let full_ref = parsed.full_reference();
-        if self.store.get(&full_ref).await.is_some() {
-            self.store.remove(&full_ref).await?;
+        if self.store.find(&full_ref).await.is_some() {
+            self.store.remove_resolved(&full_ref).await?;
             Ok(true)
         } else {
             Ok(false)
