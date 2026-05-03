@@ -26,6 +26,10 @@ struct Args {
     #[arg(long, default_value = "~/.a3s/images")]
     image_dir: String,
 
+    /// Default sandbox/agent image used when a pod omits a3s.box/agent-image.
+    #[arg(long)]
+    sandbox_image: Option<String>,
+
     /// Maximum image cache size in bytes (default: 10GB).
     #[arg(long, default_value = "10737418240")]
     image_cache_size: u64,
@@ -57,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         socket = %args.socket.display(),
         image_dir = %image_dir.display(),
+        sandbox_image = args.sandbox_image.as_deref().unwrap_or(""),
         cache_size = args.image_cache_size,
         streaming_addr = %args.streaming_addr,
         "Starting A3S Box CRI Runtime"
@@ -72,8 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth = RegistryAuth::from_env();
 
     // Create and start CRI server
-    let server =
-        CriServer::new(args.socket, image_store, auth).with_streaming_addr(args.streaming_addr);
+    let server = CriServer::new(args.socket, image_store, auth)
+        .with_default_sandbox_image(args.sandbox_image)
+        .with_streaming_addr(args.streaming_addr);
     server.serve().await?;
 
     Ok(())
@@ -94,5 +100,16 @@ mod tests {
         let args =
             Args::try_parse_from(["a3s-box-cri", "--streaming-addr", "0.0.0.0:19090"]).unwrap();
         assert_eq!(args.streaming_addr, "0.0.0.0:19090".parse().unwrap());
+    }
+
+    #[test]
+    fn test_args_custom_sandbox_image() {
+        let args =
+            Args::try_parse_from(["a3s-box-cri", "--sandbox-image", "registry.local/a3s:cri"])
+                .unwrap();
+        assert_eq!(
+            args.sandbox_image.as_deref(),
+            Some("registry.local/a3s:cri")
+        );
     }
 }

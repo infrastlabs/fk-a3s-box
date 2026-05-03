@@ -22,11 +22,29 @@ const ANN_TEE_WORKLOAD_ID: &str = "a3s.box/tee-workload-id";
 
 /// Convert a CRI PodSandboxConfig to an A3S BoxConfig.
 pub fn pod_sandbox_config_to_box_config(config: &PodSandboxConfig) -> Result<BoxConfig> {
+    pod_sandbox_config_to_box_config_with_default(config, None)
+}
+
+/// Convert a CRI PodSandboxConfig to an A3S BoxConfig with a runtime default
+/// sandbox image used when the pod does not provide `a3s.box/agent-image`.
+pub fn pod_sandbox_config_to_box_config_with_default(
+    config: &PodSandboxConfig,
+    default_agent_image: Option<&str>,
+) -> Result<BoxConfig> {
     let annotations = &config.annotations;
 
-    let image = annotations.get(ANN_AGENT_IMAGE).cloned().ok_or_else(|| {
-        BoxError::ConfigError(format!("Annotation '{}' is required", ANN_AGENT_IMAGE))
-    })?;
+    let image = annotations
+        .get(ANN_AGENT_IMAGE)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| default_agent_image.filter(|value| !value.trim().is_empty()))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            BoxError::ConfigError(format!(
+                "Annotation '{}' or configured sandbox image is required",
+                ANN_AGENT_IMAGE
+            ))
+        })?;
 
     let resources = parse_resources(annotations);
     let tee = parse_tee_config(annotations)?;
@@ -117,6 +135,30 @@ mod tests {
     fn test_missing_image_annotation() {
         let config = make_config(HashMap::new());
         assert!(pod_sandbox_config_to_box_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_default_agent_image_used_without_annotation() {
+        let config = make_config(HashMap::new());
+        let box_config =
+            pod_sandbox_config_to_box_config_with_default(&config, Some("registry.local/a3s:cri"))
+                .unwrap();
+
+        assert_eq!(box_config.image, "registry.local/a3s:cri");
+    }
+
+    #[test]
+    fn test_agent_image_annotation_overrides_default() {
+        let annotations = HashMap::from([(
+            ANN_AGENT_IMAGE.to_string(),
+            "pod-specific:latest".to_string(),
+        )]);
+        let config = make_config(annotations);
+        let box_config =
+            pod_sandbox_config_to_box_config_with_default(&config, Some("registry.local/a3s:cri"))
+                .unwrap();
+
+        assert_eq!(box_config.image, "pod-specific:latest");
     }
 
     #[test]
