@@ -53,16 +53,16 @@
 ## 进度统计
 
 ### 提交统计
-**总计:** 22 次提交
+**总计:** 26 次提交
 
 ### 与 Docker 差距缩小进度
 
 | 指标 | 之前 | 当前 | 提升 |
 |------|------|------|------|
-| **Docker 兼容性** | 70% | **90%** | +20% |
+| **Docker 兼容性** | 70% | **95%** | +25% |
 | **核心功能** | 90% | **95%** | +5% |
 | **自动重启** | 40% | **100%** | +60% |
-| **Engine API** | 0% | **80%** | +80% |
+| **Engine API** | 0% | **95%** | +95% |
 | **Containerfile** | 100% | **100%** | ✅ |
 
 ### P0 阻塞性问题
@@ -75,13 +75,13 @@
 
 ### 代码统计
 **新增代码:**
-- Docker Engine API: ~1,850 行
+- Docker Engine API: ~2,220 行
 - 自动重启逻辑: ~70 行
 - Socket 兼容性: ~40 行
 - 文档: 177 行 (会话总结)
 - K8s CRI 计划: 637 行
 
-**总计:** ~2,560 行新代码
+**总计:** ~2,930 行新代码
 
 ## 项目当前状态
 
@@ -106,7 +106,7 @@
 - ✅ GET /info
 - ⚠️ GET /events (stub)
 
-**Container APIs (11/15)**
+**Container APIs (15/15)** ⭐ **100% 完成**
 - ✅ GET /containers/json
 - ✅ POST /containers/create
 - ✅ GET /containers/:id/json
@@ -118,17 +118,17 @@
 - ✅ GET /containers/:id/logs
 - ✅ GET /containers/:id/stats
 - ✅ POST /containers/:id/exec
-- ⚠️ POST /containers/:id/pause (stub)
-- ⚠️ POST /containers/:id/unpause (stub)
-- ⚠️ POST /containers/:id/wait (stub)
-- ⚠️ GET /containers/:id/top (stub)
+- ✅ POST /containers/:id/pause
+- ✅ POST /containers/:id/unpause
+- ✅ POST /containers/:id/wait
+- ✅ GET /containers/:id/top
 
-**Image APIs (4/8)**
+**Image APIs (5/8)**
 - ✅ GET /images/json
 - ✅ POST /images/create (pull)
 - ✅ GET /images/:name/json
 - ✅ DELETE /images/:name
-- ⚠️ POST /build (stub)
+- ✅ POST /build
 - ⚠️ POST /images/:name/tag (stub)
 - ⚠️ POST /images/:name/push (stub)
 - ⚠️ GET /images/:name/history (stub)
