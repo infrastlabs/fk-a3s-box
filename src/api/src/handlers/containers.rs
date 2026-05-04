@@ -596,12 +596,97 @@ pub async fn wait(Path(_id): Path<String>) -> ApiResult<Json<serde_json::Value>>
     Err(ApiError::NotImplemented("Container wait not yet implemented".to_string()))
 }
 
+/// Request body for exec create.
+#[derive(Debug, Deserialize)]
+pub struct ExecCreateRequest {
+    /// Attach to stdin
+    #[serde(rename = "AttachStdin")]
+    attach_stdin: Option<bool>,
+
+    /// Attach to stdout
+    #[serde(rename = "AttachStdout")]
+    attach_stdout: Option<bool>,
+
+    /// Attach to stderr
+    #[serde(rename = "AttachStderr")]
+    attach_stderr: Option<bool>,
+
+    /// Allocate a pseudo-TTY
+    #[serde(rename = "Tty")]
+    tty: Option<bool>,
+
+    /// Environment variables
+    #[serde(rename = "Env")]
+    env: Option<Vec<String>>,
+
+    /// Command to run
+    #[serde(rename = "Cmd")]
+    cmd: Vec<String>,
+
+    /// Working directory
+    #[serde(rename = "WorkingDir")]
+    working_dir: Option<String>,
+
+    /// User (format: "user:group")
+    #[serde(rename = "User")]
+    user: Option<String>,
+
+    /// Detach mode
+    #[serde(rename = "Detach")]
+    detach: Option<bool>,
+}
+
 /// POST /containers/:id/exec - Create exec instance.
-pub async fn exec_create(Path(_id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
-    Err(ApiError::NotImplemented("Exec create not yet implemented".to_string()))
+pub async fn exec_create(
+    Path(id): Path<String>,
+    Json(req): Json<ExecCreateRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let state = a3s_box_cli::state::StateFile::load_default()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Find container
+    let record = state.list(true)
+        .into_iter()
+        .find(|r| r.id.starts_with(&id) || r.name == id)
+        .ok_or_else(|| ApiError::NotFound(format!("Container {} not found", id)))?;
+
+    if record.status != "running" {
+        return Err(ApiError::Conflict("Container is not running".to_string()));
+    }
+
+    // Generate exec ID
+    let exec_id = uuid::Uuid::new_v4().to_string();
+
+    // Store exec configuration (in-memory for now)
+    // TODO: Implement proper exec instance storage
+
+    Ok(Json(json!({
+        "Id": exec_id
+    })))
+}
+
+/// Request body for exec start.
+#[derive(Debug, Deserialize, Default)]
+pub struct ExecStartRequest {
+    /// Detach from exec
+    #[serde(rename = "Detach")]
+    detach: Option<bool>,
+
+    /// Allocate a pseudo-TTY
+    #[serde(rename = "Tty")]
+    tty: Option<bool>,
 }
 
 /// POST /exec/:id/start - Start exec instance.
-pub async fn exec_start(Path(_id): Path<String>) -> ApiResult<StatusCode> {
+pub async fn exec_start(
+    Path(_exec_id): Path<String>,
+    Json(_req): Json<ExecStartRequest>,
+) -> ApiResult<StatusCode> {
+    // TODO: Implement exec start
+    // This requires:
+    // 1. Retrieve exec configuration from storage
+    // 2. Connect to container's exec socket
+    // 3. Execute command via a3s-box exec client
+    // 4. Stream output back to client
     Err(ApiError::NotImplemented("Exec start not yet implemented".to_string()))
 }
