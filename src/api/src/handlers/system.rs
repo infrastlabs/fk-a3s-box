@@ -37,13 +37,31 @@ pub async fn info() -> ApiResult<Json<serde_json::Value>> {
     let running = containers.iter().filter(|c| c.status == "running").count();
     let stopped = containers.iter().filter(|c| c.status != "running").count();
 
+    // Get image count from store
+    let image_count = {
+        let store_path = a3s_box_core::dirs_home().join("images");
+        if let Ok(store) = a3s_box_runtime::oci::ImageStore::new(store_path) {
+            store.list().map(|imgs| imgs.len()).unwrap_or(0)
+        } else {
+            0
+        }
+    };
+
+    // Get system memory
+    let mem_total = {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.total_memory()
+    };
+
     Ok(Json(json!({
         "ID": uuid::Uuid::new_v4().to_string(),
         "Containers": containers.len(),
         "ContainersRunning": running,
         "ContainersPaused": 0,
         "ContainersStopped": stopped,
-        "Images": 0, // TODO: Get from image store
+        "Images": image_count,
         "Driver": "a3s-box",
         "DriverStatus": [],
         "SystemStatus": null,
@@ -79,7 +97,7 @@ pub async fn info() -> ApiResult<Json<serde_json::Value>> {
         "IndexServerAddress": "https://index.docker.io/v1/",
         "RegistryConfig": {},
         "NCPU": num_cpus::get(),
-        "MemTotal": 0, // TODO: Get system memory
+        "MemTotal": mem_total,
         "GenericResources": null,
         "DockerRootDir": a3s_box_core::dirs_home().display().to_string(),
         "HttpProxy": "",

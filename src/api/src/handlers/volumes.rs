@@ -8,10 +8,27 @@ use crate::error::{ApiResult, ApiError};
 
 /// GET /volumes - List volumes.
 pub async fn list() -> ApiResult<Json<serde_json::Value>> {
-    // TODO: Integrate with volume store
-    // For now, return empty list
+    let store = a3s_box_runtime::VolumeStore::default_path()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let volumes = store.list()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let result: Vec<_> = volumes.iter().map(|v| {
+        json!({
+            "Name": v.name,
+            "Driver": v.driver,
+            "Mountpoint": v.mount_point,
+            "CreatedAt": v.created_at.to_rfc3339(),
+            "Status": {},
+            "Labels": v.labels,
+            "Scope": "local",
+            "Options": {}
+        })
+    }).collect();
+
     Ok(Json(json!({
-        "Volumes": [],
+        "Volumes": result,
         "Warnings": null
     })))
 }
@@ -34,53 +51,61 @@ pub struct VolumeCreateRequest {
 
 /// POST /volumes/create - Create a volume.
 pub async fn create(Json(req): Json<VolumeCreateRequest>) -> ApiResult<Json<serde_json::Value>> {
-    // TODO: Implement volume creation
-    // For now, return a stub response
-    let volume_path = format!("/var/lib/a3s-box/volumes/{}", req.name);
+    let store = a3s_box_runtime::VolumeStore::default_path()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let mut config = a3s_box_core::volume::VolumeConfig::new(&req.name, "");
+    config.driver = req.driver.unwrap_or_else(|| "local".to_string());
+    if let Some(labels) = req.labels {
+        config.labels = labels;
+    }
+
+    let created = store.create(config)
+        .map_err(|e| ApiError::Conflict(e.to_string()))?;
 
     Ok(Json(json!({
-        "Name": req.name,
-        "Driver": req.driver.unwrap_or_else(|| "local".to_string()),
-        "Mountpoint": volume_path,
-        "CreatedAt": chrono::Utc::now().to_rfc3339(),
+        "Name": created.name,
+        "Driver": created.driver,
+        "Mountpoint": created.mount_point,
+        "CreatedAt": created.created_at.to_rfc3339(),
         "Status": {},
-        "Labels": req.labels.unwrap_or_default(),
-        "Scope": "local",
-        "Options": req.driver_opts.unwrap_or_default()
-    })))
-}
-
-/// GET /volumes/:name - Inspect a volume.
-pub async fn inspect(Path(name): Path<String>) -> ApiResult<Json<serde_json::Value>> {
-    // TODO: Integrate with volume store
-    // For now, return a stub response
-    let volume_path = format!("/var/lib/a3s-box/volumes/{}", name);
-
-    Ok(Json(json!({
-        "Name": name,
-        "Driver": "local",
-        "Mountpoint": volume_path,
-        "CreatedAt": chrono::Utc::now().to_rfc3339(),
-        "Status": {},
-        "Labels": {},
+        "Labels": created.labels,
         "Scope": "local",
         "Options": {}
     })))
 }
 
-/// Query parameters for volume remove.
-#[derive(Debug, Deserialize, Default)]
-pub struct RemoveQuery {
-    /// Force removal
-    #[serde(default)]
-    force: bool,
+/// GET /volumes/:name - Inspect a volume.
+pub async fn inspect(Path(name): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+    let store = a3s_box_runtime::VolumeStore::default_path()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let volume = store.get(&name)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("Volume {} not found", name)))?;
+
+    Ok(Json(json!({
+        "Name": volume.name,
+        "Driver": volume.driver,
+        "Mountpoint": volume.mount_point,
+        "CreatedAt": volume.created_at.to_rfc3339(),
+        "Status": {},
+        "Labels": volume.labels,
+        "Scope": "local",
+        "Options": {}
+    })))
 }
 
 /// DELETE /volumes/:name - Remove a volume.
 pub async fn remove(
-    Path(_name): Path<String>,
-    axum::extract::Query(_query): axum::extract::Query<RemoveQuery>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<RemoveQuery>,
 ) -> ApiResult<StatusCode> {
-    // TODO: Implement volume removal
+    let store = a3s_box_runtime::VolumeStore::default_path()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    store.remove(&name, query.force)
+        .map_err(|e| ApiError::Conflict(e.to_string()))?;
+
     Ok(StatusCode::NO_CONTENT)
 }
