@@ -140,11 +140,7 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
                         {
                             continue;
                         }
-                        if args.timestamps {
-                            print!("{} {}", Utc::now().to_rfc3339(), line);
-                        } else {
-                            print!("{line}");
-                        }
+                        print_line(trimmed, args.timestamps);
                     }
                 }
                 Err(e) => {
