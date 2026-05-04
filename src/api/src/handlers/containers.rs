@@ -388,14 +388,192 @@ pub async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Query parameters for logs.
+#[derive(Debug, Deserialize, Default)]
+pub struct LogsQuery {
+    /// Follow log output
+    #[serde(default)]
+    follow: bool,
+
+    /// Show stdout
+    #[serde(default = "default_true")]
+    stdout: bool,
+
+    /// Show stderr
+    #[serde(default = "default_true")]
+    stderr: bool,
+
+    /// Show timestamps
+    #[serde(default)]
+    timestamps: bool,
+
+    /// Number of lines from end
+    tail: Option<String>,
+
+    /// Show logs since timestamp
+    since: Option<String>,
+
+    /// Show logs until timestamp
+    until: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// GET /containers/:id/logs - Get container logs.
-pub async fn logs(Path(_id): Path<String>) -> ApiResult<String> {
-    Err(ApiError::NotImplemented("Container logs not yet implemented".to_string()))
+pub async fn logs(
+    Path(id): Path<String>,
+    Query(query): Query<LogsQuery>,
+) -> ApiResult<String> {
+    let state = a3s_box_cli::state::StateFile::load_default()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Find container
+    let record = state.list(true)
+        .into_iter()
+        .find(|r| r.id.starts_with(&id) || r.name == id)
+        .ok_or_else(|| ApiError::NotFound(format!("Container {} not found", id)))?;
+
+    // Check if logging is enabled
+    if record.log_config.driver == a3s_box_core::log::LogDriver::None {
+        return Err(ApiError::BadRequest(
+            "Logging is disabled for this container".to_string()
+        ));
+    }
+
+    // Get log file path
+    let log_dir = record.box_dir.join("logs");
+    let json_log = a3s_box_runtime::log::json_log_path(&log_dir);
+    let log_path = if json_log.exists() {
+        json_log
+    } else {
+        record.console_log.clone()
+    };
+
+    if !log_path.exists() {
+        return Err(ApiError::NotFound("No logs found for container".to_string()));
+    }
+
+    // Read log file
+    let content = std::fs::read_to_string(&log_path)
+        .map_err(|e| ApiError::Internal(format!("Failed to read logs: {}", e)))?;
+
+    // TODO: Implement follow mode with streaming
+    // TODO: Implement tail filtering
+    // TODO: Implement timestamp filtering
+    // TODO: Implement stdout/stderr filtering
+
+    Ok(content)
+}
+
+/// Query parameters for stats.
+#[derive(Debug, Deserialize, Default)]
+pub struct StatsQuery {
+    /// Stream stats (default: true)
+    #[serde(default = "default_true")]
+    stream: bool,
+
+    /// Only get a single stat
+    #[serde(default)]
+    one_shot: bool,
 }
 
 /// GET /containers/:id/stats - Get container stats.
-pub async fn stats(Path(_id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
-    Err(ApiError::NotImplemented("Container stats not yet implemented".to_string()))
+pub async fn stats(
+    Path(id): Path<String>,
+    Query(query): Query<StatsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let state = a3s_box_cli::state::StateFile::load_default()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Find container
+    let record = state.list(true)
+        .into_iter()
+        .find(|r| r.id.starts_with(&id) || r.name == id)
+        .ok_or_else(|| ApiError::NotFound(format!("Container {} not found", id)))?;
+
+    if record.status != "running" {
+        return Err(ApiError::Conflict("Container is not running".to_string()));
+    }
+
+    let pid = record.pid.ok_or_else(|| ApiError::Internal("No PID found".to_string()))?;
+
+    // Collect stats using sysinfo
+    use sysinfo::{Pid, System};
+    let mut sys = System::new();
+    let spid = Pid::from_u32(pid);
+
+    // First refresh
+    sys.refresh_process(spid);
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    // Second refresh for CPU delta
+    sys.refresh_process(spid);
+
+    let proc_info = sys.process(spid)
+        .ok_or_else(|| ApiError::Internal("Process not found".to_string()))?;
+
+    let cpu_percent = proc_info.cpu_usage();
+    let memory_bytes = proc_info.memory();
+    let memory_limit = (record.memory_mb as u64) * 1024 * 1024;
+
+    // Build Docker-compatible stats response
+    let stats = json!({
+        "read": chrono::Utc::now().to_rfc3339(),
+        "preread": chrono::Utc::now().to_rfc3339(),
+        "pids_stats": {
+            "current": 1
+        },
+        "blkio_stats": {},
+        "num_procs": 0,
+        "storage_stats": {},
+        "cpu_stats": {
+            "cpu_usage": {
+                "total_usage": 0,
+                "usage_in_kernelmode": 0,
+                "usage_in_usermode": 0
+            },
+            "system_cpu_usage": 0,
+            "online_cpus": num_cpus::get(),
+            "throttling_data": {
+                "periods": 0,
+                "throttled_periods": 0,
+                "throttled_time": 0
+            }
+        },
+        "precpu_stats": {
+            "cpu_usage": {
+                "total_usage": 0,
+                "usage_in_kernelmode": 0,
+                "usage_in_usermode": 0
+            },
+            "system_cpu_usage": 0,
+            "online_cpus": num_cpus::get(),
+            "throttling_data": {
+                "periods": 0,
+                "throttled_periods": 0,
+                "throttled_time": 0
+            }
+        },
+        "memory_stats": {
+            "usage": memory_bytes,
+            "max_usage": memory_bytes,
+            "stats": {},
+            "limit": memory_limit
+        },
+        "name": format!("/{}", record.name),
+        "id": record.id,
+        "networks": {},
+        "cpu_percent": cpu_percent,
+        "memory_percent": if memory_limit > 0 {
+            (memory_bytes as f64 / memory_limit as f64) * 100.0
+        } else {
+            0.0
+        }
+    });
+
+    // TODO: Implement streaming mode
+    Ok(Json(stats))
 }
 
 /// GET /containers/:id/top - List processes.
