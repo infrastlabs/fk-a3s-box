@@ -168,7 +168,57 @@ pub async fn remove(
     })))
 }
 
+/// Query parameters for build.
+#[derive(Debug, Deserialize, Default)]
+pub struct BuildQuery {
+    /// Name and optional tag for the image
+    #[serde(rename = "t")]
+    tag: Option<String>,
+
+    /// Path to Dockerfile
+    #[serde(rename = "dockerfile")]
+    dockerfile: Option<String>,
+
+    /// Suppress verbose build output
+    #[serde(default)]
+    q: bool,
+
+    /// Build arguments (JSON object)
+    #[serde(rename = "buildargs")]
+    build_args: Option<String>,
+
+    /// Target platform
+    platform: Option<String>,
+}
+
 /// POST /build - Build an image from a Dockerfile.
-pub async fn build() -> ApiResult<()> {
-    Err(ApiError::NotImplemented("Image build not yet implemented".to_string()))
+pub async fn build(Query(query): Query<BuildQuery>) -> ApiResult<Json<serde_json::Value>> {
+    // Parse build args from JSON string
+    let build_arg_vec = if let Some(args_json) = query.build_args {
+        let args_map: HashMap<String, String> = serde_json::from_str(&args_json)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid build args: {}", e)))?;
+        args_map.into_iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Use a3s-box build command
+    let build_args = a3s_box_cli::commands::build::BuildArgs {
+        path: ".".to_string(), // TODO: Extract from request body (tarball)
+        tag: query.tag,
+        file: query.dockerfile,
+        build_arg: build_arg_vec,
+        quiet: query.q,
+        platform: query.platform,
+    };
+
+    let result = a3s_box_cli::commands::build::execute(build_args).await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // TODO: Get actual image ID from build result
+    Ok(Json(json!({
+        "stream": "Successfully built image\n"
+    })))
 }
