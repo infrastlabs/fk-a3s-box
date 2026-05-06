@@ -261,11 +261,11 @@ fn find_system_libkrun() -> Result<PathBuf, String> {
     Err("libkrun not found in system paths".to_string())
 }
 
-/// Like `has_library`, but requires the file to be named exactly
-/// `lib<name>.<ext>` or `lib<name>.<version>.<ext>` — i.e. the character
-/// after the name must be a `.` (or end of stem). This prevents matching
-/// against sibling libraries such as `libkrun-efi.dylib` when looking for
-/// `libkrun.dylib`.
+/// Checks if `dir` contains a library named exactly `lib<name>.<ext>`.
+/// This is stricter than `has_library`: it prevents matching sibling
+/// libraries like `libkrun-efi.dylib` when looking for `libkrun.dylib`.
+/// Both unversioned (`libkrun.dylib`) and versioned (`libkrun.so.1`)
+/// library names are accepted.
 fn has_exact_library(dir: &Path, name: &str) -> bool {
     let extensions: &[&str] = if cfg!(target_os = "macos") {
         &["dylib"]
@@ -280,16 +280,16 @@ fn has_exact_library(dir: &Path, name: &str) -> bool {
         .ok()
         .map(|entries| {
             entries.filter_map(Result::ok).any(|entry| {
-                let filename = entry.file_name().to_string_lossy().to_string();
-                let Some(rest) = filename.strip_prefix(&prefix) else {
+                let filename = entry.file_name();
+                let filename_str = filename.to_string_lossy();
+                let Some(rest) = filename_str.strip_prefix(&prefix) else {
                     return false;
                 };
-                if !rest.starts_with('.') {
-                    return false;
-                }
-                extensions
-                    .iter()
-                    .any(|ext| entry.path().extension().is_some_and(|e| e == *ext))
+                // Accept if rest equals extension (unversioned) or starts with
+                // '.' and ends with extension (versioned, e.g. libkrun.so.1)
+                extensions.iter().any(|ext| {
+                    rest == *ext || (rest.starts_with('.') && rest.ends_with(ext))
+                })
             })
         })
         .unwrap_or(false)
