@@ -42,7 +42,7 @@ A3S Box is application-agnostic. It doesn't know what's inside the VM — web se
 |-----------|-------------|
 | OCI Images | Pull, push, build, tag, inspect from any registry with local LRU cache |
 | Dockerfile/Containerfile Build | Multi-stage builds, all instructions, `ADD <url>` HTTP download, `ONBUILD` triggers |
-| Multi-Platform | `--platform linux/amd64,linux/arm64` with OCI Image Index |
+| Target Platform | `--platform linux/amd64` records a single OCI target platform; multi-platform indexes are planned |
 | Snapshot/Restore | Configuration-based VM snapshots |
 | Cross-Platform | macOS ARM64, Linux x86_64/ARM64, Windows x86_64 |
 | Warm Pool | Pre-booted VMs for instant allocation |
@@ -96,6 +96,8 @@ A3S Box is application-agnostic. It doesn't know what's inside the VM — web se
 
 - CRI v1 implementation (RuntimeService + ImageService)
 - DaemonSet + RuntimeClass deployment via Helm
+- One-container Pods resolve pulled OCI images into per-container rootfs
+  directories before non-interactive CRI start/exec.
 
 ## Quick Start
 
@@ -216,7 +218,7 @@ a3s-box pull [OPTIONS] IMAGE              # Pull from registry
 
 a3s-box push IMAGE [TAG]                  # Push to registry
 a3s-box build [OPTIONS] -t TAG PATH      # Dockerfile/Containerfile build
-  --platform LINUX/ARCH,...  # Multi-arch
+  --platform LINUX/ARCH      # Single target platform
 a3s-box images                           # List cached
 a3s-box rmi IMAGE [IMAGE...]              # Remove images
 a3s-box tag IMAGE NEW_TAG                 # Create alias
@@ -226,6 +228,11 @@ a3s-box history IMAGE                     # Layer history
 a3s-box save -o FILE.tar IMAGE           # Export archive
 a3s-box load -i FILE.tar                 # Import archive
 ```
+
+Build note: Dockerfile `RUN` currently requires Linux for isolated execution.
+On macOS it fails by default rather than executing on the host. For local
+experiments only, set `A3S_BOX_UNSAFE_HOST_RUN=1` to opt into unsafe host-side
+execution.
 
 ### Filesystem
 
@@ -463,6 +470,7 @@ just lint               # Clippy
 |----------|-------------|---------|
 | `A3S_HOME` | Data directory | `~/.a3s` |
 | `A3S_DEPS_STUB` | Skip libkrun for CI | — |
+| `A3S_BOX_CRI_AGENT_IMAGE` | Default CRI sandbox agent/rootfs image | `ghcr.io/a3s-box/code:v0.1.0` |
 | `A3S_IMAGE_CACHE_SIZE` | Cache size | `10g` |
 | `A3S_TEE_SIMULATE` | TEE simulation | — |
 | `RUST_LOG` | Log level | `info` |

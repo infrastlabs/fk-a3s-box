@@ -1030,6 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires registry network access"]
     async fn test_verify_image_signature_cosign_keyless_no_signature() {
         // Keyless verification now attempts to fetch from registry.
         // With a fake digest, it should return NoSignature or Failed (network error).

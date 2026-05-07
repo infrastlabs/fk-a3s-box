@@ -110,6 +110,8 @@ mod tests {
             annotations: HashMap::new(),
             log_directory: "/var/log/pods".to_string(),
             runtime_handler: "a3s".to_string(),
+            network_ip: String::new(),
+            additional_ips: vec![],
         }
     }
 
@@ -119,6 +121,16 @@ mod tests {
             sandbox_id: sandbox_id.to_string(),
             name: format!("container-{}", id),
             image_ref: "alpine:latest".to_string(),
+            resolved_image_digest: "sha256:test".to_string(),
+            resolved_image_path: "/".to_string(),
+            command: vec!["sleep".to_string()],
+            args: vec!["3600".to_string()],
+            env: vec![("ENV".to_string(), "test".to_string())],
+            working_dir: "/".to_string(),
+            user: Some("1000:1001".to_string()),
+            stdin: false,
+            stdin_once: false,
+            tty: false,
             state: ContainerState::Running,
             created_at: 1_000_000_000,
             started_at: 2_000_000_000,
@@ -127,6 +139,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             log_path: String::new(),
+            rootfs_path: "/".to_string(),
+            rootfs_guest_path: format!("/run/a3s/cri/container-rootfs/{sandbox_id}/{id}/rootfs"),
         }
     }
 

@@ -262,6 +262,11 @@ impl VmManager {
                 .push(("BOX_WINDOWS_PORT_FWD".to_string(), "1".to_string()));
         }
 
+        #[cfg(not(target_os = "windows"))]
+        entrypoint
+            .env
+            .push(("BOX_CRI_PORT_FWD".to_string(), "1".to_string()));
+
         // Inject sidecar configuration so guest-init can launch the sidecar process
         if let Some(ref sidecar) = self.config.sidecar {
             entrypoint
@@ -303,6 +308,7 @@ impl VmManager {
             exec_socket_path: layout.exec_socket_path.clone(),
             pty_socket_path: layout.pty_socket_path.clone(),
             attest_socket_path: layout.attest_socket_path.clone(),
+            port_forward_socket_path: layout.port_forward_socket_path.clone(),
             fs_mounts,
             entrypoint,
             console_output: layout.console_output.clone(),

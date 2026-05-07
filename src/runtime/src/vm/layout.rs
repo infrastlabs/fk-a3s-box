@@ -144,6 +144,7 @@ impl VmManager {
             exec_socket_path: socket_dir.join("exec.sock"),
             pty_socket_path: socket_dir.join("pty.sock"),
             attest_socket_path: socket_dir.join("attest.sock"),
+            port_forward_socket_path: socket_dir.join("portfwd.sock"),
             workspace_path,
             console_output: Some(logs_dir.join("console.log")),
             oci_config,
@@ -523,6 +524,7 @@ mod tests {
             rootfs_provider: crate::rootfs::default_provider(),
             exec_socket_path: None,
             pty_socket_path: None,
+            port_forward_socket_path: None,
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
@@ -688,6 +690,58 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("not connected"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_exec_request_rejects_empty_command() {
+        let tmp = TempDir::new().unwrap();
+        let vm = make_vm_manager_with_home(tmp.path());
+        *vm.state.write().await = BoxState::Ready;
+
+        let request = a3s_box_core::exec::ExecRequest {
+            cmd: vec![],
+            timeout_ns: 0,
+            env: vec!["ENV=test".to_string()],
+            working_dir: Some("/app".to_string()),
+            rootfs: None,
+            stdin: None,
+            stdin_streaming: false,
+            user: None,
+            streaming: false,
+        };
+        let result = vm.exec_request(&request).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("non-empty command"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_exec_request_no_client_preserves_request_fields() {
+        let tmp = TempDir::new().unwrap();
+        let vm = make_vm_manager_with_home(tmp.path());
+        *vm.state.write().await = BoxState::Ready;
+
+        let request = a3s_box_core::exec::ExecRequest {
+            cmd: vec!["printenv".to_string()],
+            timeout_ns: 123,
+            env: vec!["ENV=test".to_string()],
+            working_dir: Some("/app".to_string()),
+            rootfs: Some("/run/a3s/cri/container-rootfs/sb/c/rootfs".to_string()),
+            stdin: Some(b"input".to_vec()),
+            stdin_streaming: false,
+            user: Some("1000:1000".to_string()),
+            streaming: false,
+        };
+        let result = vm.exec_request(&request).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not connected"));
+        assert_eq!(request.env, vec!["ENV=test".to_string()]);
+        assert_eq!(request.working_dir, Some("/app".to_string()));
+        assert_eq!(request.stdin, Some(b"input".to_vec()));
+        assert_eq!(request.user, Some("1000:1000".to_string()));
     }
 
     #[test]

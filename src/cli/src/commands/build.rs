@@ -31,7 +31,9 @@ pub struct BuildArgs {
     #[arg(short, long)]
     pub quiet: bool,
 
-    /// Target platform(s) for multi-platform builds (e.g., "linux/amd64,linux/arm64")
+    /// Target platform for the build (e.g., "linux/amd64").
+    ///
+    /// Multi-platform image indexes are not supported yet.
     #[arg(long)]
     pub platform: Option<String>,
 }
@@ -57,12 +59,7 @@ pub async fn execute(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> 
     // Open image store
     let store = Arc::new(super::open_image_store()?);
 
-    // Parse target platforms
-    let platforms = match &args.platform {
-        Some(p) => a3s_box_core::platform::Platform::parse_list(p)
-            .map_err(|e| format!("Invalid --platform: {e}"))?,
-        None => vec![],
-    };
+    let platforms = parse_platforms(args.platform.as_deref())?;
 
     let config = a3s_box_runtime::BuildConfig {
         context_dir,
@@ -93,6 +90,24 @@ fn parse_build_args(args: &[String]) -> Result<HashMap<String, String>, String> 
         map.insert(key.to_string(), value.to_string());
     }
     Ok(map)
+}
+
+fn parse_platforms(
+    platform: Option<&str>,
+) -> Result<Vec<a3s_box_core::platform::Platform>, Box<dyn std::error::Error>> {
+    let Some(platform) = platform else {
+        return Ok(vec![]);
+    };
+
+    let platforms = a3s_box_core::platform::Platform::parse_list(platform)
+        .map_err(|e| format!("Invalid --platform: {e}"))?;
+    if platforms.len() > 1 {
+        return Err(
+            "Multi-platform builds are not implemented yet; pass a single --platform value".into(),
+        );
+    }
+
+    Ok(platforms)
 }
 
 fn resolve_build_file(
@@ -160,6 +175,27 @@ mod tests {
             result.get("URL"),
             Some(&"http://example.com?a=1".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_platforms_empty() {
+        let result = parse_platforms(None).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_platforms_single() {
+        let result = parse_platforms(Some("linux/amd64")).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "linux/amd64");
+    }
+
+    #[test]
+    fn test_parse_platforms_rejects_multiple() {
+        let err = parse_platforms(Some("linux/amd64,linux/arm64"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Multi-platform builds are not implemented yet"));
     }
 
     #[test]

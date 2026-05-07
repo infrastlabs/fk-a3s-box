@@ -95,6 +95,22 @@ impl PersistentCriStore {
         updated
     }
 
+    pub async fn mark_container_started_if_created(&self, id: &str, started_at: i64) -> bool {
+        let updated = self
+            .containers
+            .mark_started_if_created(id, started_at)
+            .await;
+        if updated {
+            if let Err(e) = self.persist().await {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to persist CRI state after mark_container_started_if_created"
+                );
+            }
+        }
+        updated
+    }
+
     pub async fn mark_container_exited(&self, id: &str, finished_at: i64, exit_code: i32) -> bool {
         let updated = self
             .containers
@@ -103,6 +119,27 @@ impl PersistentCriStore {
         if updated {
             if let Err(e) = self.persist().await {
                 tracing::warn!(error = %e, "Failed to persist CRI state after mark_container_exited");
+            }
+        }
+        updated
+    }
+
+    pub async fn mark_container_exited_if_running(
+        &self,
+        id: &str,
+        finished_at: i64,
+        exit_code: i32,
+    ) -> bool {
+        let updated = self
+            .containers
+            .mark_exited_if_running(id, finished_at, exit_code)
+            .await;
+        if updated {
+            if let Err(e) = self.persist().await {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to persist CRI state after mark_container_exited_if_running"
+                );
             }
         }
         updated
@@ -148,6 +185,8 @@ mod tests {
             annotations: HashMap::new(),
             log_directory: "/var/log/pods".to_string(),
             runtime_handler: "a3s".to_string(),
+            network_ip: String::new(),
+            additional_ips: vec![],
         }
     }
 
@@ -157,6 +196,16 @@ mod tests {
             sandbox_id: sandbox_id.to_string(),
             name: format!("container-{}", id),
             image_ref: "alpine:latest".to_string(),
+            resolved_image_digest: "sha256:test".to_string(),
+            resolved_image_path: "/".to_string(),
+            command: vec!["sleep".to_string()],
+            args: vec!["3600".to_string()],
+            env: vec![("ENV".to_string(), "test".to_string())],
+            working_dir: "/".to_string(),
+            user: Some("1000:1001".to_string()),
+            stdin: false,
+            stdin_once: false,
+            tty: false,
             state: ContainerState::Running,
             created_at: 1_000_000_000,
             started_at: 2_000_000_000,
@@ -165,6 +214,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             log_path: String::new(),
+            rootfs_path: "/".to_string(),
+            rootfs_guest_path: format!("/run/a3s/cri/container-rootfs/{sandbox_id}/{id}/rootfs"),
         }
     }
 
@@ -253,6 +304,75 @@ mod tests {
         let c = store2.containers.get("c1").await.unwrap();
         assert_eq!(c.state, ContainerState::Exited);
         assert_eq!(c.exit_code, 42);
+        assert_eq!(c.finished_at, 3_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_mark_container_started_if_created_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+
+        store.add_sandbox(sample_sandbox("sb1")).await;
+        let mut container = sample_container("c1", "sb1");
+        container.state = ContainerState::Created;
+        container.started_at = 0;
+        store.add_container(container).await;
+        store
+            .mark_container_started_if_created("c1", 2_000_000_000)
+            .await;
+
+        let store2 = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+        store2.load().await.unwrap();
+
+        let c = store2.containers.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Running);
+        assert_eq!(c.started_at, 2_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_mark_container_exited_if_running_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+
+        store.add_sandbox(sample_sandbox("sb1")).await;
+        store.add_container(sample_container("c1", "sb1")).await;
+        store
+            .mark_container_exited_if_running("c1", 3_000_000_000, 17)
+            .await;
+
+        let store2 = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+        store2.load().await.unwrap();
+
+        let c = store2.containers.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Exited);
+        assert_eq!(c.exit_code, 17);
+        assert_eq!(c.finished_at, 3_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_mark_container_exited_if_running_preserves_existing_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let store = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+
+        store.add_sandbox(sample_sandbox("sb1")).await;
+        store.add_container(sample_container("c1", "sb1")).await;
+        store.mark_container_exited("c1", 3_000_000_000, 7).await;
+
+        assert!(
+            !store
+                .mark_container_exited_if_running("c1", 4_000_000_000, 17)
+                .await
+        );
+
+        let store2 = PersistentCriStore::new(Arc::new(JsonStateStore::new(&path)));
+        store2.load().await.unwrap();
+
+        let c = store2.containers.get("c1").await.unwrap();
+        assert_eq!(c.state, ContainerState::Exited);
+        assert_eq!(c.exit_code, 7);
         assert_eq!(c.finished_at, 3_000_000_000);
     }
 

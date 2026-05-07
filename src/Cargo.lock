@@ -54,6 +54,7 @@ version = "2.0.3"
 dependencies = [
  "a3s-box-core",
  "a3s-box-runtime",
+ "a3s-common",
  "async-trait",
  "base64 0.22.1",
  "chrono",

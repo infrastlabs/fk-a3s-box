@@ -20,7 +20,7 @@ use a3s_box_core::EXEC_VSOCK_PORT;
 #[cfg(target_os = "windows")]
 use a3s_box_core::PORT_FWD_VSOCK_PORT;
 #[cfg(not(target_os = "windows"))]
-use a3s_box_core::{ATTEST_VSOCK_PORT, PTY_VSOCK_PORT};
+use a3s_box_core::{ATTEST_VSOCK_PORT, PORT_FWD_VSOCK_PORT, PTY_VSOCK_PORT};
 #[cfg(target_os = "macos")]
 use a3s_box_netproxy::spawn_inherited_netproxy;
 use clap::Parser;
@@ -582,6 +582,25 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
                 "Configuring vsock bridge for attestation"
             );
             ctx.add_vsock_port(ATTEST_VSOCK_PORT, attest_socket_str, true)?;
+        }
+
+        if !spec.port_forward_socket_path.as_os_str().is_empty() {
+            let port_forward_socket_str =
+                spec.port_forward_socket_path
+                    .to_str()
+                    .ok_or_else(|| BoxError::BoxBootError {
+                        message: format!(
+                            "Invalid port-forward socket path: {}",
+                            spec.port_forward_socket_path.display()
+                        ),
+                        hint: None,
+                    })?;
+            tracing::debug!(
+                socket_path = port_forward_socket_str,
+                guest_port = PORT_FWD_VSOCK_PORT,
+                "Configuring vsock bridge for CRI port-forward control"
+            );
+            ctx.add_vsock_port(PORT_FWD_VSOCK_PORT, port_forward_socket_str, true)?;
         }
     }
 

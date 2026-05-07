@@ -287,9 +287,9 @@ fn has_exact_library(dir: &Path, name: &str) -> bool {
                 };
                 // Accept if rest equals extension (unversioned) or starts with
                 // '.' and ends with extension (versioned, e.g. libkrun.so.1)
-                extensions.iter().any(|ext| {
-                    rest == *ext || (rest.starts_with('.') && rest.ends_with(ext))
-                })
+                extensions
+                    .iter()
+                    .any(|ext| rest == *ext || (rest.starts_with('.') && rest.ends_with(ext)))
             })
         })
         .unwrap_or(false)

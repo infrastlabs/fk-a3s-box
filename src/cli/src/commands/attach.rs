@@ -93,6 +93,7 @@ async fn execute_pty_attach(
         cmd: vec!["/bin/sh".to_string()],
         env: vec![],
         working_dir: None,
+        rootfs: None,
         user: None,
         cols,
         rows,

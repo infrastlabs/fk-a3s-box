@@ -189,7 +189,9 @@ pub async fn execute(args: ContainerUpdateArgs) -> Result<(), Box<dyn std::error
                             timeout_ns: 5_000_000_000,
                             env: vec![],
                             working_dir: None,
+                            rootfs: None,
                             stdin: None,
+                            stdin_streaming: false,
                             user: None,
                             streaming: false,
                         };

@@ -2,15 +2,36 @@
 //!
 //! Maps CRI image operations to A3S Box ImageStore and ImagePuller.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::Stream;
 use tonic::{Request, Response, Status};
 
+use a3s_box_core::StoredImage;
 use a3s_box_runtime::oci::{ImagePuller, ImageStore, RegistryAuth};
 
 use crate::cri_api::image_service_server::ImageService;
 use crate::cri_api::*;
 use crate::error::box_error_to_status;
+
+type CriImageResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+fn image_summary(img: StoredImage) -> Image {
+    Image {
+        id: img.digest.clone(),
+        repo_tags: vec![img.reference.clone()],
+        repo_digests: vec![format!("{}@{}", img.reference, img.digest)],
+        size: img.size_bytes,
+        uid: None,
+        username: String::new(),
+        spec: Some(ImageSpec {
+            image: img.reference,
+            annotations: Default::default(),
+        }),
+        pinned: false,
+    }
+}
 
 /// A3S Box implementation of the CRI ImageService.
 pub struct BoxImageService {
@@ -31,6 +52,8 @@ impl BoxImageService {
 
 #[tonic::async_trait]
 impl ImageService for BoxImageService {
+    type StreamImagesStream = CriImageResponseStream<StreamImagesResponse>;
+
     async fn list_images(
         &self,
         request: Request<ListImagesRequest>,
@@ -39,24 +62,43 @@ impl ImageService for BoxImageService {
 
         let stored_images = self.image_store.list().await;
 
-        let images: Vec<Image> = stored_images
-            .into_iter()
-            .map(|img| Image {
-                id: img.digest.clone(),
-                repo_tags: vec![img.reference.clone()],
-                repo_digests: vec![format!("{}@{}", img.reference, img.digest)],
-                size: img.size_bytes,
-                uid: None,
-                username: String::new(),
-                spec: Some(ImageSpec {
-                    image: img.reference,
-                    annotations: Default::default(),
-                }),
-                pinned: false,
-            })
-            .collect();
+        let images: Vec<Image> = stored_images.into_iter().map(image_summary).collect();
 
         Ok(Response::new(ListImagesResponse { images }))
+    }
+
+    async fn stream_images(
+        &self,
+        request: Request<StreamImagesRequest>,
+    ) -> Result<Response<Self::StreamImagesStream>, Status> {
+        let req = request.into_inner();
+        let image_filter = req
+            .filter
+            .and_then(|filter| filter.image)
+            .map(|image| image.image)
+            .filter(|image| !image.is_empty());
+
+        let mut images: Vec<Image> = self
+            .image_store
+            .list()
+            .await
+            .into_iter()
+            .map(image_summary)
+            .collect();
+        if let Some(image_filter) = image_filter {
+            images.retain(|image| {
+                image
+                    .spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.image == image_filter)
+            });
+        }
+
+        let stream: Self::StreamImagesStream =
+            Box::pin(tokio_stream::iter(vec![Ok(StreamImagesResponse {
+                images,
+            })]));
+        Ok(Response::new(stream))
     }
 
     async fn image_status(
@@ -70,19 +112,7 @@ impl ImageService for BoxImageService {
 
         let stored = self.image_store.get(&image_spec.image).await;
 
-        let image = stored.map(|img| Image {
-            id: img.digest.clone(),
-            repo_tags: vec![img.reference.clone()],
-            repo_digests: vec![format!("{}@{}", img.reference, img.digest)],
-            size: img.size_bytes,
-            uid: None,
-            username: String::new(),
-            spec: Some(ImageSpec {
-                image: img.reference,
-                annotations: Default::default(),
-            }),
-            pinned: false,
-        });
+        let image = stored.map(image_summary);
 
         Ok(Response::new(ImageStatusResponse {
             image,
@@ -157,6 +187,7 @@ impl ImageService for BoxImageService {
 mod tests {
     use super::*;
     use a3s_box_runtime::oci::ImageStore;
+    use futures::StreamExt;
 
     /// Create a test ImageStore backed by a temp directory.
     fn make_test_store() -> (Arc<ImageStore>, tempfile::TempDir) {
@@ -224,6 +255,34 @@ mod tests {
             .collect();
         assert!(refs.contains(&"nginx:latest"));
         assert!(refs.contains(&"alpine:3.18"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_images_with_filter() {
+        let (svc, _tmp) = make_test_service();
+        put_test_image(&svc.image_store, "nginx:latest", "sha256:aaa111").await;
+        put_test_image(&svc.image_store, "alpine:3.18", "sha256:bbb222").await;
+
+        let mut stream = svc
+            .stream_images(Request::new(StreamImagesRequest {
+                filter: Some(ImageFilter {
+                    image: Some(ImageSpec {
+                        image: "alpine:3.18".to_string(),
+                        annotations: Default::default(),
+                    }),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let response = stream.next().await.unwrap().unwrap();
+        assert_eq!(response.images.len(), 1);
+        assert_eq!(
+            response.images[0].spec.as_ref().unwrap().image,
+            "alpine:3.18"
+        );
+        assert!(stream.next().await.is_none());
     }
 
     // ── ImageStatus ──────────────────────────────────────────────────

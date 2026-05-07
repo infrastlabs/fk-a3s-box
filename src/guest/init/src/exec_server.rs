@@ -2,16 +2,24 @@
 //!
 //! Listens on vsock port 4089 and accepts Frame-based requests.
 //! Each connection: read a Data frame (JSON ExecRequest), execute,
-//! send a Data frame (JSON ExecOutput), close.
+//! then send either a one-shot `ExecOutput` or streaming chunk/exit frames.
 
 use std::io::Read;
 use std::io::Write;
+use std::sync::mpsc;
 use std::time::Duration;
 
-use a3s_box_core::exec::{ExecOutput, DEFAULT_EXEC_TIMEOUT_NS, EXEC_VSOCK_PORT, MAX_OUTPUT_BYTES};
-#[cfg(any(target_os = "linux", test))]
-use a3s_transport::frame::FrameType;
+use a3s_box_core::exec::{
+    ExecChunk, ExecExit, ExecOutput, StreamType, DEFAULT_EXEC_TIMEOUT_NS, EXEC_VSOCK_PORT,
+    MAX_OUTPUT_BYTES,
+};
+use a3s_transport::FrameType;
 use tracing::{info, warn};
+
+/// Maximum payload bytes per streamed exec chunk.
+const STREAM_CHUNK_BYTES: usize = 16 * 1024;
+const EXEC_CONTROL_CANCEL: &[u8] = b"cancel";
+const EXEC_CONTROL_STDIN_CLOSE: &[u8] = b"stdin-close";
 
 /// Run the exec server, listening on vsock port 4089.
 ///
@@ -64,9 +72,11 @@ fn run_vsock_server() -> Result<(), Box<dyn std::error::Error>> {
         match accept(sock_fd.as_raw_fd()) {
             Ok(client_fd) => {
                 let client = unsafe { OwnedFd::from_raw_fd(client_fd) };
-                if let Err(e) = handle_connection(client) {
-                    warn!("Failed to handle exec connection: {}", e);
-                }
+                std::thread::spawn(move || {
+                    if let Err(e) = handle_connection(client) {
+                        warn!("Failed to handle exec connection: {}", e);
+                    }
+                });
             }
             Err(e) => {
                 error!("Accept failed: {}", e);
@@ -80,7 +90,7 @@ fn run_vsock_server() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// 1. Read a Data frame containing JSON ExecRequest
 /// 2. Execute the command
-/// 3. Send a Data frame containing JSON ExecOutput
+/// 3. Send either a one-shot ExecOutput frame or streaming exec frames
 #[cfg(target_os = "linux")]
 fn handle_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
     use a3s_box_core::exec::ExecRequest;
@@ -123,19 +133,36 @@ fn handle_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::error:
         }
     };
 
-    // Execute the command
-    let output = execute_command(
-        &exec_req.cmd,
-        exec_req.timeout_ns,
-        &exec_req.env,
-        exec_req.working_dir.as_deref(),
-        exec_req.stdin.as_deref(),
-        exec_req.user.as_deref(),
-    );
+    if exec_req.streaming {
+        let input_rx = spawn_exec_input_monitor(&stream)?;
+        execute_command_streaming(
+            &exec_req.cmd,
+            exec_req.timeout_ns,
+            &exec_req.env,
+            exec_req.working_dir.as_deref(),
+            exec_req.rootfs.as_deref(),
+            exec_req.stdin.as_deref(),
+            exec_req.stdin_streaming,
+            exec_req.user.as_deref(),
+            Some(input_rx),
+            &mut stream,
+        )?;
+    } else {
+        // Execute the command
+        let output = execute_command(
+            &exec_req.cmd,
+            exec_req.timeout_ns,
+            &exec_req.env,
+            exec_req.working_dir.as_deref(),
+            exec_req.rootfs.as_deref(),
+            exec_req.stdin.as_deref(),
+            exec_req.user.as_deref(),
+        );
 
-    // Send response as Data frame with JSON payload
-    let response_payload = serde_json::to_vec(&output)?;
-    write_frame(&mut stream, FrameType::Data as u8, &response_payload)?;
+        // Send response as Data frame with JSON payload
+        let response_payload = serde_json::to_vec(&output)?;
+        write_frame(&mut stream, FrameType::Data as u8, &response_payload)?;
+    }
 
     std::mem::forget(fd);
     Ok(())
@@ -185,25 +212,131 @@ fn send_error_frame(w: &mut impl Write, message: &str) -> std::io::Result<()> {
     write_frame(w, FrameType::Error as u8, message.as_bytes())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum ExecInputEvent {
+    Stdin(Vec<u8>),
+    StdinClose,
+    Cancel,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn spawn_exec_input_monitor(
+    stream: &std::fs::File,
+) -> std::io::Result<mpsc::Receiver<ExecInputEvent>> {
+    let mut reader = stream.try_clone()?;
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || loop {
+        match read_frame(&mut reader) {
+            Ok(Some((frame_type, payload)))
+                if frame_type == FrameType::Control as u8 && payload == EXEC_CONTROL_CANCEL =>
+            {
+                let _ = tx.send(ExecInputEvent::Cancel);
+                break;
+            }
+            Ok(Some((frame_type, payload)))
+                if frame_type == FrameType::Control as u8
+                    && payload == EXEC_CONTROL_STDIN_CLOSE =>
+            {
+                if tx.send(ExecInputEvent::StdinClose).is_err() {
+                    break;
+                }
+            }
+            Ok(Some((frame_type, payload))) if frame_type == FrameType::Data as u8 => {
+                if tx.send(ExecInputEvent::Stdin(payload)).is_err() {
+                    break;
+                }
+            }
+            Ok(Some((frame_type, _))) if frame_type == FrameType::Close as u8 => {
+                let _ = tx.send(ExecInputEvent::Cancel);
+                break;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => {
+                warn!("Failed to read exec control frame: {}", e);
+                break;
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
+/// Serialize a completed command output as streaming exec frames.
+///
+/// This keeps validation and spawn errors compatible with
+/// `ExecClient::exec_stream()` even when no child process is running.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_exec_stream_response(
+    w: &mut impl Write,
+    output: &ExecOutput,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_exec_stream_chunks(w, StreamType::Stdout, &output.stdout)?;
+    write_exec_stream_chunks(w, StreamType::Stderr, &output.stderr)?;
+    write_exec_exit(w, output.exit_code)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_exec_stream_chunks(
+    w: &mut impl Write,
+    stream: StreamType,
+    data: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for chunk in data.chunks(STREAM_CHUNK_BYTES) {
+        write_exec_stream_chunk(w, stream, chunk)?;
+    }
+
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_exec_stream_chunk(
+    w: &mut impl Write,
+    stream: StreamType,
+    data: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let payload = serde_json::to_vec(&ExecChunk {
+        stream,
+        data: data.to_vec(),
+    })?;
+    write_frame(w, FrameType::Data as u8, &payload)?;
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_exec_exit(w: &mut impl Write, exit_code: i32) -> Result<(), Box<dyn std::error::Error>> {
+    let exit = ExecExit { exit_code };
+    let payload = serde_json::to_vec(&exit)?;
+    write_frame(w, FrameType::Control as u8, &payload)?;
+    Ok(())
+}
+
 /// Execute a command with timeout, environment variables, working directory, optional stdin, and optional user.
 ///
 /// When `user` is specified, the command is wrapped with `su -s /bin/sh <user> -c <cmd>`
 /// to run as the given user inside the guest VM.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn execute_command(
+fn build_command(
     cmd: &[String],
     timeout_ns: u64,
     env: &[String],
     working_dir: Option<&str>,
+    rootfs: Option<&str>,
     stdin_data: Option<&[u8]>,
+    stdin_streaming: bool,
     user: Option<&str>,
-) -> ExecOutput {
+) -> Result<(std::process::Command, Duration), ExecOutput> {
     if cmd.is_empty() {
-        return ExecOutput {
+        return Err(ExecOutput {
             stdout: vec![],
             stderr: b"Empty command".to_vec(),
             exit_code: 1,
-        };
+        });
     }
 
     let timeout_ns = if timeout_ns == 0 {
@@ -212,6 +345,49 @@ fn execute_command(
         timeout_ns
     };
     let timeout = Duration::from_nanos(timeout_ns);
+    let workdir = working_dir.unwrap_or("/");
+
+    if let Some(rootfs) = rootfs {
+        if rootfs.is_empty()
+            || !rootfs.starts_with('/')
+            || rootfs.contains('\0')
+            || workdir.contains('\0')
+        {
+            return Err(ExecOutput {
+                stdout: vec![],
+                stderr: format!("Invalid rootfs path: {rootfs}").into_bytes(),
+                exit_code: 1,
+            });
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(ExecOutput {
+                stdout: vec![],
+                stderr: b"Rootfs execution requires a Linux guest".to_vec(),
+                exit_code: 1,
+            });
+        }
+
+        #[cfg(target_os = "linux")]
+        match std::fs::metadata(rootfs) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(ExecOutput {
+                    stdout: vec![],
+                    stderr: format!("Rootfs path is not a directory: {rootfs}").into_bytes(),
+                    exit_code: 1,
+                });
+            }
+            Err(e) => {
+                return Err(ExecOutput {
+                    stdout: vec![],
+                    stderr: format!("Rootfs path is unavailable: {rootfs} ({e})").into_bytes(),
+                    exit_code: 1,
+                });
+            }
+        }
+    }
 
     // If a user is specified, wrap the command with `su`
     let (program, args) = if let Some(user) = user {
@@ -240,7 +416,7 @@ fn execute_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    if stdin_data.is_some() {
+    if stdin_data.is_some() || stdin_streaming {
         command.stdin(std::process::Stdio::piped());
     }
 
@@ -250,9 +426,66 @@ fn execute_command(
         }
     }
 
-    if let Some(dir) = working_dir {
-        command.current_dir(dir);
+    configure_child_process(&mut command, rootfs, workdir);
+    if rootfs.is_none() {
+        if let Some(dir) = working_dir {
+            command.current_dir(dir);
+        }
     }
+
+    Ok((command, timeout))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_child_stdin(child: &mut std::process::Child, stdin_data: Option<&[u8]>, keep_open: bool) {
+    if let Some(data) = stdin_data {
+        if keep_open {
+            if let Some(stdin_pipe) = child.stdin.as_mut() {
+                let _ = stdin_pipe.write_all(data);
+                let _ = stdin_pipe.flush();
+            }
+        } else if let Some(mut stdin_pipe) = child.stdin.take() {
+            let _ = stdin_pipe.write_all(data);
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_child_output(child: &mut std::process::Child) -> (Vec<u8>, Vec<u8>) {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(ref mut out) = child.stdout {
+        let _ = out.read_to_end(&mut stdout);
+    }
+    if let Some(ref mut err) = child.stderr {
+        let _ = err.read_to_end(&mut stderr);
+    }
+    (stdout, stderr)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn execute_command(
+    cmd: &[String],
+    timeout_ns: u64,
+    env: &[String],
+    working_dir: Option<&str>,
+    rootfs: Option<&str>,
+    stdin_data: Option<&[u8]>,
+    user: Option<&str>,
+) -> ExecOutput {
+    let (mut command, timeout) = match build_command(
+        cmd,
+        timeout_ns,
+        env,
+        working_dir,
+        rootfs,
+        stdin_data,
+        false,
+        user,
+    ) {
+        Ok(command) => command,
+        Err(output) => return output,
+    };
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -265,12 +498,7 @@ fn execute_command(
         }
     };
 
-    if let Some(data) = stdin_data {
-        if let Some(mut stdin_pipe) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin_pipe.write_all(data);
-        }
-    }
+    write_child_stdin(&mut child, stdin_data, false);
 
     // Wait with timeout using a polling loop
     let start = std::time::Instant::now();
@@ -279,14 +507,7 @@ fn execute_command(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(ref mut out) = child.stdout {
-                    let _ = out.read_to_end(&mut stdout);
-                }
-                if let Some(ref mut err) = child.stderr {
-                    let _ = err.read_to_end(&mut stderr);
-                }
+                let (stdout, stderr) = read_child_output(&mut child);
 
                 return ExecOutput {
                     stdout: truncate_output(stdout),
@@ -297,17 +518,9 @@ fn execute_command(
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     warn!("Exec command timed out after {:?}, killing", timeout);
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_child_process_group(&mut child);
 
-                    let mut stdout = Vec::new();
-                    let mut stderr = Vec::new();
-                    if let Some(ref mut out) = child.stdout {
-                        let _ = out.read_to_end(&mut stdout);
-                    }
-                    if let Some(ref mut err) = child.stderr {
-                        let _ = err.read_to_end(&mut stderr);
-                    }
+                    let (stdout, mut stderr) = read_child_output(&mut child);
 
                     stderr.extend_from_slice(b"\nProcess killed: timeout exceeded");
 
@@ -328,6 +541,314 @@ fn execute_command(
             }
         }
     }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum StreamReaderEvent {
+    Chunk(StreamType, Vec<u8>),
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum StreamingStopReason {
+    Timeout,
+    Cancelled,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn spawn_stream_reader<R>(
+    stream: StreamType,
+    mut reader: R,
+    sender: mpsc::Sender<StreamReaderEvent>,
+) -> std::thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut buffer = vec![0u8; STREAM_CHUNK_BYTES];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = buffer[..n].to_vec();
+                    if sender
+                        .send(StreamReaderEvent::Chunk(stream, chunk))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    warn!(stream = %stream, error = %e, "Failed to read exec output stream");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn drain_stream_reader_events(
+    receiver: &mpsc::Receiver<StreamReaderEvent>,
+    writer: &mut impl Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    while let Ok(StreamReaderEvent::Chunk(stream, data)) = receiver.try_recv() {
+        write_exec_stream_chunk(writer, stream, &data)?;
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn wait_streaming_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    input_rx: Option<&mpsc::Receiver<ExecInputEvent>>,
+    receiver: &mpsc::Receiver<StreamReaderEvent>,
+    writer: &mut impl Write,
+) -> Result<(i32, Option<StreamingStopReason>), Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+    let poll_interval = Duration::from_millis(20);
+
+    loop {
+        if drain_exec_input_events(child, input_rx) {
+            warn!("Streaming exec command received stop request, killing");
+            kill_child_process_group(child);
+            return Ok((137, Some(StreamingStopReason::Cancelled)));
+        }
+
+        match receiver.recv_timeout(poll_interval) {
+            Ok(StreamReaderEvent::Chunk(stream, data)) => {
+                write_exec_stream_chunk(writer, stream, &data)?;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+
+        if drain_exec_input_events(child, input_rx) {
+            warn!("Streaming exec command received stop request, killing");
+            kill_child_process_group(child);
+            return Ok((137, Some(StreamingStopReason::Cancelled)));
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((status.code().unwrap_or(1), None)),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    warn!(
+                        "Streaming exec command timed out after {:?}, killing",
+                        timeout
+                    );
+                    kill_child_process_group(child);
+                    return Ok((137, Some(StreamingStopReason::Timeout)));
+                }
+            }
+            Err(e) => {
+                write_exec_stream_chunk(
+                    writer,
+                    StreamType::Stderr,
+                    format!("Failed to wait for command: {e}").as_bytes(),
+                )?;
+                return Ok((1, None));
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn drain_exec_input_events(
+    child: &mut std::process::Child,
+    input_rx: Option<&mpsc::Receiver<ExecInputEvent>>,
+) -> bool {
+    let Some(input_rx) = input_rx else {
+        return false;
+    };
+
+    loop {
+        match input_rx.try_recv() {
+            Ok(ExecInputEvent::Stdin(data)) => write_live_child_stdin(child, &data),
+            Ok(ExecInputEvent::StdinClose) => {
+                let _ = child.stdin.take();
+            }
+            Ok(ExecInputEvent::Cancel) => return true,
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return false,
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_live_child_stdin(child: &mut std::process::Child, data: &[u8]) {
+    let mut close_stdin = false;
+
+    if let Some(stdin_pipe) = child.stdin.as_mut() {
+        match stdin_pipe.write_all(data).and_then(|_| stdin_pipe.flush()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                close_stdin = true;
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to write streaming exec stdin");
+                close_stdin = true;
+            }
+        }
+    }
+
+    if close_stdin {
+        let _ = child.stdin.take();
+    }
+}
+
+/// Execute a command and emit stdout/stderr chunks while the process is running.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn execute_command_streaming(
+    cmd: &[String],
+    timeout_ns: u64,
+    env: &[String],
+    working_dir: Option<&str>,
+    rootfs: Option<&str>,
+    stdin_data: Option<&[u8]>,
+    stdin_streaming: bool,
+    user: Option<&str>,
+    input_rx: Option<mpsc::Receiver<ExecInputEvent>>,
+    writer: &mut impl Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut command, timeout) = match build_command(
+        cmd,
+        timeout_ns,
+        env,
+        working_dir,
+        rootfs,
+        stdin_data,
+        stdin_streaming,
+        user,
+    ) {
+        Ok(command) => command,
+        Err(output) => {
+            write_exec_stream_response(writer, &output)?;
+            return Ok(());
+        }
+    };
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let output = ExecOutput {
+                stdout: vec![],
+                stderr: format!("Failed to spawn command '{}': {}", cmd[0], e).into_bytes(),
+                exit_code: 127,
+            };
+            write_exec_stream_response(writer, &output)?;
+            return Ok(());
+        }
+    };
+
+    write_child_stdin(&mut child, stdin_data, stdin_streaming);
+
+    let (sender, receiver) = mpsc::channel();
+    let mut readers = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_stream_reader(
+            StreamType::Stdout,
+            stdout,
+            sender.clone(),
+        ));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_stream_reader(
+            StreamType::Stderr,
+            stderr,
+            sender.clone(),
+        ));
+    }
+    drop(sender);
+
+    let wait_result =
+        wait_streaming_child(&mut child, timeout, input_rx.as_ref(), &receiver, writer);
+    let (exit_code, stop_reason) = match wait_result {
+        Ok(result) => result,
+        Err(error) => {
+            kill_child_process_group(&mut child);
+            for reader in readers {
+                let _ = reader.join();
+            }
+            return Err(error);
+        }
+    };
+
+    for reader in readers {
+        let _ = reader.join();
+    }
+    drain_stream_reader_events(&receiver, writer)?;
+
+    match stop_reason {
+        Some(StreamingStopReason::Timeout) => {
+            write_exec_stream_chunk(
+                writer,
+                StreamType::Stderr,
+                b"\nProcess killed: timeout exceeded",
+            )?;
+        }
+        Some(StreamingStopReason::Cancelled) => {
+            write_exec_stream_chunk(
+                writer,
+                StreamType::Stderr,
+                b"\nProcess killed: stop requested",
+            )?;
+        }
+        None => {}
+    }
+
+    write_exec_exit(writer, exit_code)
+}
+
+#[cfg(unix)]
+fn configure_child_process(
+    command: &mut std::process::Command,
+    rootfs: Option<&str>,
+    workdir: &str,
+) {
+    use std::ffi::CString;
+    use std::os::unix::process::CommandExt;
+
+    let rootfs = rootfs
+        .map(|rootfs| CString::new(rootfs.as_bytes()).expect("rootfs path was pre-validated"));
+    let workdir = CString::new(workdir.as_bytes()).expect("working directory was pre-validated");
+
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if let Some(rootfs) = rootfs.as_ref() {
+                if libc::chroot(rootfs.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::chdir(workdir.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_child_process(
+    _command: &mut std::process::Command,
+    _rootfs: Option<&str>,
+    _workdir: &str,
+) {
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn kill_child_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let pid = child.id() as i32;
+        if pid > 0 {
+            let _ = libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Truncate output to MAX_OUTPUT_BYTES if it exceeds the limit.
@@ -392,6 +913,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(output.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
@@ -407,6 +929,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_ne!(output.exit_code, 0);
         assert!(!output.stderr.is_empty());
@@ -414,7 +937,7 @@ mod tests {
 
     #[test]
     fn test_execute_command_empty() {
-        let output = execute_command(&[], 0, &[], None, None, None);
+        let output = execute_command(&[], 0, &[], None, None, None, None);
         assert_eq!(output.exit_code, 1);
         assert_eq!(output.stderr, b"Empty command");
     }
@@ -425,6 +948,7 @@ mod tests {
             &["sh".to_string(), "-c".to_string(), "exit 42".to_string()],
             0,
             &[],
+            None,
             None,
             None,
             None,
@@ -445,6 +969,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(output.exit_code, 0);
         assert_eq!(
@@ -455,10 +980,25 @@ mod tests {
 
     #[test]
     fn test_execute_command_with_working_dir() {
-        let output = execute_command(&["pwd".to_string()], 0, &[], Some("/tmp"), None, None);
+        let output = execute_command(&["pwd".to_string()], 0, &[], Some("/tmp"), None, None, None);
         assert_eq!(output.exit_code, 0);
         let pwd = String::from_utf8_lossy(&output.stdout).trim().to_string();
         assert!(pwd == "/tmp" || pwd == "/private/tmp");
+    }
+
+    #[test]
+    fn test_execute_command_rejects_relative_rootfs() {
+        let output = execute_command(
+            &["true".to_string()],
+            0,
+            &[],
+            None,
+            Some("relative/rootfs"),
+            None,
+            None,
+        );
+        assert_eq!(output.exit_code, 1);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid rootfs path"));
     }
 
     #[test]
@@ -472,6 +1012,7 @@ mod tests {
             &["cat".to_string()],
             0,
             &[],
+            None,
             None,
             Some(b"hello from stdin"),
             None,
@@ -511,5 +1052,292 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
         let result = read_frame(&mut cursor).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_write_exec_stream_response() {
+        let output = ExecOutput {
+            stdout: b"hello".to_vec(),
+            stderr: b"warn".to_vec(),
+            exit_code: 42,
+        };
+
+        let mut buf = Vec::new();
+        write_exec_stream_response(&mut buf, &output).unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let (ft, payload) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(ft, FrameType::Data as u8);
+        let chunk: ExecChunk = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(chunk.stream, StreamType::Stdout);
+        assert_eq!(chunk.data, b"hello");
+
+        let (ft, payload) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(ft, FrameType::Data as u8);
+        let chunk: ExecChunk = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(chunk.stream, StreamType::Stderr);
+        assert_eq!(chunk.data, b"warn");
+
+        let (ft, payload) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(ft, FrameType::Control as u8);
+        let exit: ExecExit = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(exit.exit_code, 42);
+
+        assert!(read_frame(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_write_exec_stream_response_chunks_large_output() {
+        let output = ExecOutput {
+            stdout: vec![b'a'; STREAM_CHUNK_BYTES + 7],
+            stderr: vec![],
+            exit_code: 0,
+        };
+
+        let mut buf = Vec::new();
+        write_exec_stream_response(&mut buf, &output).unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let (ft, payload) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(ft, FrameType::Data as u8);
+        let chunk: ExecChunk = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(chunk.stream, StreamType::Stdout);
+        assert_eq!(chunk.data.len(), STREAM_CHUNK_BYTES);
+
+        let (ft, payload) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(ft, FrameType::Data as u8);
+        let chunk: ExecChunk = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(chunk.stream, StreamType::Stdout);
+        assert_eq!(chunk.data.len(), 7);
+
+        let (ft, payload) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(ft, FrameType::Control as u8);
+        let exit: ExecExit = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(exit.exit_code, 0);
+
+        assert!(read_frame(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_command_streaming_writes_output_and_exit() {
+        let mut buf = Vec::new();
+        execute_command_streaming(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf out; printf err >&2; exit 7".to_string(),
+            ],
+            0,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            &mut buf,
+        )
+        .unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code = None;
+
+        while let Some((ft, payload)) = read_frame(&mut cursor).unwrap() {
+            match ft {
+                ft if ft == FrameType::Data as u8 => {
+                    let chunk: ExecChunk = serde_json::from_slice(&payload).unwrap();
+                    match chunk.stream {
+                        StreamType::Stdout => stdout.extend_from_slice(&chunk.data),
+                        StreamType::Stderr => stderr.extend_from_slice(&chunk.data),
+                    }
+                }
+                ft if ft == FrameType::Control as u8 => {
+                    let exit: ExecExit = serde_json::from_slice(&payload).unwrap();
+                    exit_code = Some(exit.exit_code);
+                }
+                other => panic!("unexpected frame type: {other}"),
+            }
+        }
+
+        assert_eq!(stdout, b"out");
+        assert_eq!(stderr, b"err");
+        assert_eq!(exit_code, Some(7));
+    }
+
+    struct FlushChannelWriter {
+        sender: std::sync::mpsc::Sender<Vec<u8>>,
+        buffer: Vec<u8>,
+    }
+
+    impl Write for FlushChannelWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if !self.buffer.is_empty() {
+                self.sender
+                    .send(std::mem::take(&mut self.buffer))
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "test receiver closed")
+                    })?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_command_streaming_emits_chunk_before_process_exit() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut writer = FlushChannelWriter {
+                sender,
+                buffer: Vec::new(),
+            };
+            execute_command_streaming(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf ready; sleep 1; printf done".to_string(),
+                ],
+                5_000_000_000,
+                &[],
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                &mut writer,
+            )
+            .unwrap();
+        });
+
+        let first_frame = receiver
+            .recv_timeout(Duration::from_millis(500))
+            .expect("streaming exec did not emit output before process exit");
+        let mut cursor = std::io::Cursor::new(first_frame);
+        let (ft, payload) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(ft, FrameType::Data as u8);
+        let chunk: ExecChunk = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(chunk.stream, StreamType::Stdout);
+        assert_eq!(chunk.data, b"ready");
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_command_streaming_writes_live_stdin() {
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            execute_command_streaming(
+                &["cat".to_string()],
+                5_000_000_000,
+                &[],
+                None,
+                None,
+                None,
+                true,
+                None,
+                Some(input_rx),
+                &mut buf,
+            )
+            .unwrap();
+            buf
+        });
+
+        input_tx
+            .send(ExecInputEvent::Stdin(b"hello live stdin".to_vec()))
+            .unwrap();
+        input_tx.send(ExecInputEvent::StdinClose).unwrap();
+
+        let mut cursor = std::io::Cursor::new(handle.join().unwrap());
+        let mut stdout = Vec::new();
+        let mut exit_code = None;
+
+        while let Some((ft, payload)) = read_frame(&mut cursor).unwrap() {
+            match ft {
+                ft if ft == FrameType::Data as u8 => {
+                    let chunk: ExecChunk = serde_json::from_slice(&payload).unwrap();
+                    if chunk.stream == StreamType::Stdout {
+                        stdout.extend_from_slice(&chunk.data);
+                    }
+                }
+                ft if ft == FrameType::Control as u8 => {
+                    let exit: ExecExit = serde_json::from_slice(&payload).unwrap();
+                    exit_code = Some(exit.exit_code);
+                }
+                other => panic!("unexpected frame type: {other}"),
+            }
+        }
+
+        assert_eq!(stdout, b"hello live stdin");
+        assert_eq!(exit_code, Some(0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_command_streaming_cancel_kills_child() {
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let mut buf = Vec::new();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            input_tx.send(ExecInputEvent::Cancel).unwrap();
+        });
+
+        execute_command_streaming(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf ready; sleep 5; printf done".to_string(),
+            ],
+            10_000_000_000,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            None,
+            Some(input_rx),
+            &mut buf,
+        )
+        .unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code = None;
+
+        while let Some((ft, payload)) = read_frame(&mut cursor).unwrap() {
+            match ft {
+                ft if ft == FrameType::Data as u8 => {
+                    let chunk: ExecChunk = serde_json::from_slice(&payload).unwrap();
+                    match chunk.stream {
+                        StreamType::Stdout => stdout.extend_from_slice(&chunk.data),
+                        StreamType::Stderr => stderr.extend_from_slice(&chunk.data),
+                    }
+                }
+                ft if ft == FrameType::Control as u8 => {
+                    let exit: ExecExit = serde_json::from_slice(&payload).unwrap();
+                    exit_code = Some(exit.exit_code);
+                }
+                other => panic!("unexpected frame type: {other}"),
+            }
+        }
+
+        assert_eq!(stdout, b"ready");
+        assert!(!String::from_utf8_lossy(&stdout).contains("done"));
+        assert!(String::from_utf8_lossy(&stderr).contains("stop requested"));
+        assert_eq!(exit_code, Some(137));
     }
 }

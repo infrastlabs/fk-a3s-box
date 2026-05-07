@@ -66,6 +66,7 @@ pub async fn execute(args: ShellArgs) -> Result<(), Box<dyn std::error::Error>> 
             cmd: vec![args.shell],
             env: vec![],
             working_dir: args.workdir,
+            rootfs: None,
             user: args.user,
             cols,
             rows,

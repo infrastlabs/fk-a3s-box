@@ -116,7 +116,9 @@ pub async fn execute(args: ExecArgs) -> Result<(), Box<dyn std::error::Error>> {
         timeout_ns,
         env: args.envs,
         working_dir: args.workdir,
+        rootfs: None,
         stdin: stdin_data,
+        stdin_streaming: false,
         user: args.user,
         streaming: false,
     };
@@ -171,6 +173,7 @@ async fn execute_pty(
         cmd: args.cmd,
         env: args.envs,
         working_dir: args.workdir,
+        rootfs: None,
         user: args.user,
         cols,
         rows,

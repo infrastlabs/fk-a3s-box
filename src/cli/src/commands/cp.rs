@@ -135,7 +135,9 @@ async fn is_directory_in_box(
         timeout_ns: DEFAULT_EXEC_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };
@@ -165,7 +167,9 @@ async fn copy_file_from_box(
         timeout_ns: DEFAULT_EXEC_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };
@@ -221,7 +225,9 @@ async fn copy_file_to_box(
         timeout_ns: DEFAULT_EXEC_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };
@@ -262,7 +268,9 @@ async fn copy_dir_from_box(
         timeout_ns: DIR_TRANSFER_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };
@@ -325,7 +333,9 @@ async fn copy_dir_to_box(
         timeout_ns: DIR_TRANSFER_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };

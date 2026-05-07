@@ -468,6 +468,7 @@ async fn run_tty(mut ctx: RunContext, args: &RunArgs) -> Result<(), Box<dyn std:
             cmd: pty_cmd,
             env: args.common.env.clone(),
             working_dir: args.common.workdir.clone(),
+            rootfs: None,
             user: args.common.user.clone(),
             cols,
             rows,

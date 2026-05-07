@@ -11,6 +11,9 @@ use super::utils::{
 };
 use super::BuildState;
 
+#[cfg(target_os = "macos")]
+const UNSAFE_HOST_RUN_ENV: &str = "A3S_BOX_UNSAFE_HOST_RUN";
+
 /// Handle COPY: copy files from build context into rootfs, create a layer.
 pub(super) fn handle_copy(
     src_patterns: &[String],
@@ -98,7 +101,7 @@ pub(super) fn handle_copy(
 
 /// Handle RUN: execute a command in the rootfs.
 ///
-/// On Linux, uses chroot. On macOS, tries Docker/Podman, or skips with a warning.
+/// On Linux, uses chroot. On macOS, isolated RUN execution is not implemented yet.
 /// Returns Some(LayerInfo) if a layer was created, None if skipped.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_run(
@@ -113,8 +116,15 @@ pub(super) fn handle_run(
 ) -> Result<Option<LayerInfo>> {
     #[cfg(target_os = "macos")]
     {
-        // On macOS, use a3s-box MicroVM to execute RUN commands
-        handle_run_via_microvm(
+        if !unsafe_host_run_enabled() {
+            return Err(BoxError::BuildError(format!(
+                "Dockerfile RUN is not supported on macOS yet because isolated Linux build \
+                 execution is not implemented. Re-run on Linux or set {UNSAFE_HOST_RUN_ENV}=1 \
+                 to opt into unsafe host-side execution for local experiments."
+            )));
+        }
+
+        handle_run_on_host_unsafe(
             command,
             rootfs_dir,
             layers_dir,
@@ -210,13 +220,20 @@ pub(super) fn handle_run(
     }
 }
 
-/// Execute RUN command directly on host (macOS fallback).
+#[cfg(target_os = "macos")]
+fn unsafe_host_run_enabled() -> bool {
+    std::env::var(UNSAFE_HOST_RUN_ENV)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+/// Execute RUN command directly on host (unsafe macOS escape hatch).
 ///
-/// Since MicroVM execution on macOS has limitations, we execute commands
-/// directly on the host filesystem within the rootfs directory.
+/// This does not provide container/Linux build semantics. It exists only for
+/// explicit local experiments while isolated macOS build execution is pending.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-fn handle_run_via_microvm(
+fn handle_run_on_host_unsafe(
     command: &str,
     rootfs_dir: &Path,
     layers_dir: &Path,
@@ -229,7 +246,7 @@ fn handle_run_via_microvm(
     use super::super::layer::DirSnapshot;
 
     if !quiet {
-        println!("→ Executing RUN command on host");
+        println!("→ Executing RUN command on host (unsafe)");
     }
 
     // Capture filesystem state before execution
@@ -566,6 +583,7 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
         tokio::runtime::Handle::current().block_on(async {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
+                .no_proxy()
                 .build()
                 .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
@@ -820,5 +838,22 @@ mod tests {
             instruction: Box::new(inner),
         };
         assert_eq!(instruction_to_string(&instr), "ONBUILD RUN echo triggered");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_handle_run_rejects_macos_without_unsafe_opt_in() {
+        std::env::remove_var(super::UNSAFE_HOST_RUN_ENV);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let layers = tmp.path().join("layers");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&layers).unwrap();
+
+        let result = super::handle_run("echo unsafe", &rootfs, &layers, "/", &[], &[], 0, true);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Dockerfile RUN is not supported on macOS yet"));
+        assert!(err.contains(super::UNSAFE_HOST_RUN_ENV));
     }
 }

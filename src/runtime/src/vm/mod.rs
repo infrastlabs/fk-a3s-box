@@ -58,6 +58,8 @@ pub(crate) struct BoxLayout {
     pub(crate) pty_socket_path: PathBuf,
     /// Path to the attestation Unix socket
     pub(crate) attest_socket_path: PathBuf,
+    /// Path to the CRI port-forward Unix socket
+    pub(crate) port_forward_socket_path: PathBuf,
     /// Path to the workspace directory
     pub(crate) workspace_path: PathBuf,
     /// Path to console output file (optional)
@@ -115,6 +117,9 @@ pub struct VmManager {
     /// Path to the PTY Unix socket (set after boot)
     pub(crate) pty_socket_path: Option<PathBuf>,
 
+    /// Path to the CRI port-forward Unix socket (set after boot)
+    pub(crate) port_forward_socket_path: Option<PathBuf>,
+
     /// Prometheus metrics (optional, for instrumented deployments).
     pub(crate) prom: Option<crate::prom::RuntimeMetrics>,
 
@@ -148,6 +153,7 @@ impl VmManager {
             rootfs_provider: crate::rootfs::default_provider(),
             exec_socket_path: None,
             pty_socket_path: None,
+            port_forward_socket_path: None,
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
@@ -175,6 +181,7 @@ impl VmManager {
             rootfs_provider: crate::rootfs::default_provider(),
             exec_socket_path: None,
             pty_socket_path: None,
+            port_forward_socket_path: None,
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
@@ -234,6 +241,7 @@ impl VmManager {
             rootfs_provider: crate::rootfs::default_provider(),
             exec_socket_path: None,
             pty_socket_path: None,
+            port_forward_socket_path: None,
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
@@ -256,6 +264,46 @@ impl VmManager {
         self.exec_client.as_ref()
     }
 
+    /// Attach this manager to an already-running shim process.
+    ///
+    /// This is useful for crash recovery or control-plane restart flows where
+    /// the workload VM is still alive and only the host-side manager state
+    /// needs to be reconstructed.
+    #[cfg(unix)]
+    pub async fn attach_running_process(
+        &mut self,
+        pid: u32,
+        exec_socket_path: PathBuf,
+        pty_socket_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let port_forward_socket_path = exec_socket_path.with_file_name("portfwd.sock");
+        let handler = crate::vmm::ShimHandler::from_pid(pid, self.box_id.clone());
+        if !handler.is_running() {
+            return Err(BoxError::StateError(format!(
+                "Cannot attach to non-running VM process {pid}"
+            )));
+        }
+
+        self.exec_client = match ExecClient::connect(&exec_socket_path).await {
+            Ok(client) => Some(client),
+            Err(error) => {
+                tracing::debug!(
+                    box_id = %self.box_id,
+                    socket_path = %exec_socket_path.display(),
+                    error = %error,
+                    "Failed to reconnect exec client while attaching to running VM"
+                );
+                None
+            }
+        };
+        self.exec_socket_path = Some(exec_socket_path);
+        self.pty_socket_path = pty_socket_path;
+        self.port_forward_socket_path = Some(port_forward_socket_path);
+        *self.handler.write().await = Some(Box::new(handler));
+        *self.state.write().await = BoxState::Ready;
+        Ok(())
+    }
+
     /// Get the exec socket path, if the VM has been booted.
     pub fn exec_socket_path(&self) -> Option<&Path> {
         self.exec_socket_path.as_deref()
@@ -264,6 +312,11 @@ impl VmManager {
     /// Get the PTY socket path, if the VM has been booted.
     pub fn pty_socket_path(&self) -> Option<&Path> {
         self.pty_socket_path.as_deref()
+    }
+
+    /// Get the CRI port-forward socket path, if the VM has been booted.
+    pub fn port_forward_socket_path(&self) -> Option<&Path> {
+        self.port_forward_socket_path.as_deref()
     }
 
     /// Inject a custom VMM provider (e.g., a VmController with a known shim path).
@@ -343,12 +396,17 @@ impl VmManager {
     ///
     /// Requires the VM to be in Ready, Busy, or Compacting state.
     #[cfg(unix)]
-    #[tracing::instrument(skip(self, cmd), fields(box_id = %self.box_id))]
-    pub async fn exec_command(
+    #[tracing::instrument(skip(self, request), fields(box_id = %self.box_id))]
+    pub async fn exec_request(
         &self,
-        cmd: Vec<String>,
-        timeout_ns: u64,
+        request: &a3s_box_core::exec::ExecRequest,
     ) -> Result<a3s_box_core::exec::ExecOutput> {
+        if request.cmd.is_empty() {
+            return Err(BoxError::ExecError(
+                "Exec request requires a non-empty command".to_string(),
+            ));
+        }
+
         let state = self.state.read().await;
         match *state {
             BoxState::Ready | BoxState::Busy | BoxState::Compacting => {}
@@ -366,18 +424,8 @@ impl VmManager {
             .as_ref()
             .ok_or_else(|| BoxError::ExecError("Exec client not connected".to_string()))?;
 
-        let request = a3s_box_core::exec::ExecRequest {
-            cmd,
-            timeout_ns,
-            env: vec![],
-            working_dir: None,
-            stdin: None,
-            user: None,
-            streaming: false,
-        };
-
         let exec_start = std::time::Instant::now();
-        let result = client.exec_command(&request).await;
+        let result = client.exec_command(request).await;
 
         // Record Prometheus metrics
         if let Some(ref prom) = self.prom {
@@ -390,6 +438,31 @@ impl VmManager {
         }
 
         result
+    }
+
+    /// Execute a command in the guest VM.
+    ///
+    /// Requires the VM to be in Ready, Busy, or Compacting state.
+    #[cfg(unix)]
+    #[tracing::instrument(skip(self, cmd), fields(box_id = %self.box_id))]
+    pub async fn exec_command(
+        &self,
+        cmd: Vec<String>,
+        timeout_ns: u64,
+    ) -> Result<a3s_box_core::exec::ExecOutput> {
+        let request = a3s_box_core::exec::ExecRequest {
+            cmd,
+            timeout_ns,
+            env: vec![],
+            working_dir: None,
+            rootfs: None,
+            stdin: None,
+            stdin_streaming: false,
+            user: None,
+            streaming: false,
+        };
+
+        self.exec_request(&request).await
     }
 
     /// Boot the VM.
@@ -544,6 +617,7 @@ impl VmManager {
         // 5b2. Store socket paths for CRI streaming access
         self.exec_socket_path = Some(layout.exec_socket_path.clone());
         self.pty_socket_path = Some(layout.pty_socket_path.clone());
+        self.port_forward_socket_path = Some(layout.port_forward_socket_path.clone());
 
         // 5c. Initialize TEE extension for TEE environments
         #[cfg(unix)]
@@ -909,4 +983,39 @@ fn default_stop_signal() -> i32 {
 #[cfg(windows)]
 fn default_stop_signal() -> i32 {
     15
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use a3s_box_core::event::EventEmitter;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_attach_running_process_infers_port_forward_socket_path() {
+        let mut vm = VmManager::with_box_id(
+            BoxConfig::default(),
+            EventEmitter::new(16),
+            "box-test".to_string(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let exec_socket_path = tmp.path().join("exec.sock");
+        let pty_socket_path = Some(tmp.path().join("pty.sock"));
+
+        vm.attach_running_process(
+            std::process::id(),
+            exec_socket_path.clone(),
+            pty_socket_path.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(vm.exec_socket_path(), Some(exec_socket_path.as_path()));
+        assert_eq!(vm.pty_socket_path(), pty_socket_path.as_deref());
+        assert_eq!(
+            vm.port_forward_socket_path(),
+            Some(exec_socket_path.with_file_name("portfwd.sock").as_path())
+        );
+        assert_eq!(vm.state().await, BoxState::Ready);
+    }
 }

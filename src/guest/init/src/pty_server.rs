@@ -119,6 +119,13 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
         std::mem::forget(fd);
         return Ok(());
     }
+    if let Err(error) =
+        validate_rootfs_request(request.rootfs.as_deref(), request.working_dir.as_deref())
+    {
+        write_error(&mut stream, &error)?;
+        std::mem::forget(fd);
+        return Ok(());
+    }
 
     info!(cmd = ?request.cmd, "PTY session starting");
 
@@ -164,8 +171,16 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
                 std::env::set_var("TERM", "xterm-256color");
             }
 
-            // Apply working directory
-            if let Some(ref dir) = request.working_dir {
+            let workdir = request.working_dir.as_deref().unwrap_or("/");
+            if let Some(ref rootfs) = request.rootfs {
+                if let Err(error) = apply_rootfs_chroot(rootfs, workdir) {
+                    eprintln!(
+                        "Failed to enter PTY rootfs {} with workdir {}: {}",
+                        rootfs, workdir, error
+                    );
+                    std::process::exit(127);
+                }
+            } else if let Some(ref dir) = request.working_dir {
                 let _ = std::env::set_current_dir(dir);
             }
 
@@ -222,6 +237,57 @@ fn handle_pty_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::er
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn validate_rootfs_request(rootfs: Option<&str>, working_dir: Option<&str>) -> Result<(), String> {
+    let Some(rootfs) = rootfs else {
+        return Ok(());
+    };
+    let workdir = working_dir.unwrap_or("/");
+
+    if rootfs.is_empty()
+        || !rootfs.starts_with('/')
+        || rootfs.contains('\0')
+        || workdir.contains('\0')
+    {
+        return Err(format!("Invalid rootfs path: {rootfs}"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        return Err("Rootfs PTY execution requires a Linux guest".to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    match std::fs::metadata(rootfs) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!("Rootfs path is not a directory: {rootfs}")),
+        Err(e) => Err(format!("Rootfs path is unavailable: {rootfs} ({e})")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_rootfs_chroot(rootfs: &str, workdir: &str) -> std::io::Result<()> {
+    use std::ffi::CString;
+
+    let rootfs = CString::new(rootfs.as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "rootfs contains NUL")
+    })?;
+    let workdir = CString::new(workdir.as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "workdir contains NUL")
+    })?;
+
+    unsafe {
+        if libc::chroot(rootfs.as_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::chdir(workdir.as_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
+
 /// Bidirectional relay between the vsock stream and the PTY master fd.
 ///
 /// Uses poll() to multiplex between:
@@ -236,9 +302,12 @@ fn relay_pty_data(
     child: nix::unistd::Pid,
 ) -> i32 {
     use a3s_box_core::pty::{
-        parse_frame, read_frame, write_data, PtyFrame, FRAME_PTY_DATA, FRAME_PTY_RESIZE,
+        parse_frame, read_frame, write_data, PtyFrame, FRAME_PTY_DATA, FRAME_PTY_ERROR,
+        FRAME_PTY_RESIZE,
     };
+    use nix::sys::signal::{kill, Signal};
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use nix::unistd::Pid;
     use std::os::fd::{AsFd, AsRawFd};
 
     let master_raw = master.as_raw_fd();
@@ -327,6 +396,7 @@ fn relay_pty_data(
                                 set_winsize(master_raw, r.cols, r.rows);
                             }
                         }
+                        FRAME_PTY_ERROR if payload.is_empty() => break,
                         _ => {} // Ignore unknown frames
                     }
                 }
@@ -365,6 +435,7 @@ fn relay_pty_data(
 
     // Ensure child is reaped
     if !child_exited {
+        terminate_pty_child(child);
         match waitpid(child, None) {
             Ok(WaitStatus::Exited(_, code)) => exit_code = code,
             Ok(WaitStatus::Signaled(_, sig, _)) => exit_code = 128 + sig as i32,
@@ -373,6 +444,15 @@ fn relay_pty_data(
     }
 
     exit_code
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_pty_child(child: nix::unistd::Pid) {
+    let pid = child.as_raw();
+    if pid > 0 {
+        let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
+        let _ = kill(child, Signal::SIGKILL);
+    }
 }
 
 /// Set terminal window size on a PTY fd.
@@ -426,5 +506,22 @@ mod tests {
     #[test]
     fn test_pty_vsock_port_constant() {
         assert_eq!(PTY_VSOCK_PORT, 4090);
+    }
+
+    #[test]
+    fn test_validate_rootfs_request_defaults() {
+        assert!(validate_rootfs_request(None, Some("/tmp")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_rootfs_request_rejects_relative_rootfs() {
+        let err = validate_rootfs_request(Some("relative/rootfs"), None).unwrap_err();
+        assert!(err.contains("Invalid rootfs path"));
+    }
+
+    #[test]
+    fn test_validate_rootfs_request_rejects_nul_workdir() {
+        let err = validate_rootfs_request(Some("/rootfs"), Some("/bad\0dir")).unwrap_err();
+        assert!(err.contains("Invalid rootfs path"));
     }
 }

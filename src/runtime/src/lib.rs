@@ -51,7 +51,10 @@ pub use audit::{read_audit_log, AuditLog, AuditQuery};
 
 // gRPC clients
 #[cfg(unix)]
-pub use grpc::{AttestationClient, ExecClient, PtyClient, RaTlsAttestationClient, StreamingExec};
+pub use grpc::{
+    AttestationClient, ExecClient, PtyClient, RaTlsAttestationClient, StreamingExec,
+    StreamingExecInput, StreamingPty, StreamingPtyInput,
+};
 #[cfg(unix)]
 pub use grpc::{SealClient, SecretEntry, SecretInjector};
 

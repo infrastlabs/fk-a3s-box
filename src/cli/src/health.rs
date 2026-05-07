@@ -99,7 +99,9 @@ async fn run_probe(exec_socket_path: &std::path::Path, cmd: &[String], timeout_n
         timeout_ns,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };

@@ -11,7 +11,11 @@ use tracing_subscriber::EnvFilter;
 
 use a3s_box_runtime::oci::{ImageStore, RegistryAuth};
 
+use a3s_box_cri::config_mapper::DEFAULT_AGENT_IMAGE;
+use a3s_box_cri::runtime_service::CriRuntimeOptions;
 use a3s_box_cri::server::CriServer;
+
+const AGENT_IMAGE_ENV: &str = "A3S_BOX_CRI_AGENT_IMAGE";
 
 /// A3S Box CRI Runtime
 #[derive(Parser, Debug)]
@@ -28,10 +32,44 @@ struct Args {
     /// Maximum image cache size in bytes (default: 10GB).
     #[arg(long, default_value = "10737418240")]
     image_cache_size: u64,
+
+    /// Default sandbox VM agent/rootfs image used when Pods omit a3s.box/agent-image.
+    #[arg(long)]
+    agent_image: Option<String>,
+
+    /// RuntimeClass-specific agent image override, formatted as HANDLER=IMAGE.
+    #[arg(long = "runtime-handler-agent-image", value_name = "HANDLER=IMAGE")]
+    runtime_handler_agent_image: Vec<String>,
+}
+
+fn parse_runtime_handler_agent_images(
+    values: &[String],
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut images = std::collections::HashMap::new();
+    for value in values {
+        let Some((handler, image)) = value.split_once('=') else {
+            return Err(format!(
+                "Invalid --runtime-handler-agent-image '{}': expected HANDLER=IMAGE",
+                value
+            ));
+        };
+
+        let handler = handler.trim();
+        let image = image.trim();
+        if handler.is_empty() || image.is_empty() {
+            return Err(format!(
+                "Invalid --runtime-handler-agent-image '{}': handler and image must be non-empty",
+                value
+            ));
+        }
+
+        images.insert(handler.to_string(), image.to_string());
+    }
+    Ok(images)
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -40,6 +78,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let default_agent_image = args
+        .agent_image
+        .clone()
+        .or_else(|| std::env::var(AGENT_IMAGE_ENV).ok())
+        .unwrap_or_else(|| DEFAULT_AGENT_IMAGE.to_string());
+    let runtime_handler_agent_images =
+        parse_runtime_handler_agent_images(&args.runtime_handler_agent_image)
+            .map_err(|e| format!("Invalid CRI runtime options: {e}"))?;
+    let runtime_options = CriRuntimeOptions {
+        default_agent_image,
+        runtime_handler_agent_images,
+    };
 
     // Resolve image directory (expand ~)
     let image_dir = if args.image_dir.starts_with('~') {
@@ -53,6 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         socket = %args.socket.display(),
         image_dir = %image_dir.display(),
         cache_size = args.image_cache_size,
+        agent_image = %runtime_options.default_agent_image,
+        runtime_handler_overrides = runtime_options.runtime_handler_agent_images.len(),
         "Starting A3S Box CRI Runtime"
     );
 
@@ -66,7 +118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth = RegistryAuth::from_env();
 
     // Create and start CRI server
-    let server = CriServer::new(args.socket, image_store, auth);
+    let server =
+        CriServer::new(args.socket, image_store, auth).with_runtime_options(runtime_options);
     server.serve().await?;
 
     Ok(())

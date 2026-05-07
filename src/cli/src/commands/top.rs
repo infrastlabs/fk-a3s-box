@@ -76,7 +76,9 @@ pub async fn execute(args: TopArgs) -> Result<(), Box<dyn std::error::Error>> {
         timeout_ns: DEFAULT_EXEC_TIMEOUT_NS,
         env: vec![],
         working_dir: None,
+        rootfs: None,
         stdin: None,
+        stdin_streaming: false,
         user: None,
         streaming: false,
     };

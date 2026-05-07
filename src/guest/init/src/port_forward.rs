@@ -11,7 +11,8 @@ use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, Vsock
 use tracing::{debug, info, warn};
 
 const HOST_CID: u32 = 2;
-const ENV_ENABLED: &str = "BOX_WINDOWS_PORT_FWD";
+const ENV_WINDOWS_ENABLED: &str = "BOX_WINDOWS_PORT_FWD";
+const ENV_CRI_ENABLED: &str = "BOX_CRI_PORT_FWD";
 
 const FRAME_OPEN: u8 = 1;
 const FRAME_OPEN_ACK: u8 = 2;
@@ -22,10 +23,18 @@ type SharedWriter = Arc<Mutex<std::fs::File>>;
 type StreamMap = Arc<Mutex<HashMap<u32, TcpStream>>>;
 
 pub fn run_port_forward_client() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var(ENV_ENABLED).as_deref() != Ok("1") {
-        return Ok(());
+    if std::env::var(ENV_WINDOWS_ENABLED).as_deref() == Ok("1") {
+        return run_windows_port_forward_client();
     }
 
+    if std::env::var(ENV_CRI_ENABLED).as_deref() == Ok("1") {
+        return run_cri_port_forward_server();
+    }
+
+    Ok(())
+}
+
+fn run_windows_port_forward_client() -> Result<(), Box<dyn std::error::Error>> {
     let mut backoff = Duration::from_millis(250);
     loop {
         match connect_control() {
@@ -51,6 +60,58 @@ pub fn run_port_forward_client() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_cri_port_forward_server() -> Result<(), Box<dyn std::error::Error>> {
+    use nix::sys::socket::{
+        accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, VsockAddr,
+    };
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    info!(
+        guest_port = PORT_FWD_VSOCK_PORT,
+        "Starting CRI port-forward server"
+    );
+
+    let sock_fd = socket(
+        AddressFamily::Vsock,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )?;
+
+    unsafe {
+        libc::fcntl(sock_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+
+    let addr = VsockAddr::new(libc::VMADDR_CID_ANY, PORT_FWD_VSOCK_PORT);
+    bind(sock_fd.as_raw_fd(), &addr)?;
+    listen(&sock_fd, Backlog::new(4)?)?;
+
+    loop {
+        match accept(sock_fd.as_raw_fd()) {
+            Ok(client_fd) => {
+                let client = unsafe { OwnedFd::from_raw_fd(client_fd) };
+                std::thread::spawn(move || {
+                    let file = std::fs::File::from(client);
+                    if let Err(err) = serve_control(file) {
+                        warn!(error = %err, "CRI port-forward control connection dropped");
+                    }
+                });
+            }
+            Err(err) => {
+                warn!(error = %err, "CRI port-forward accept failed");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_cri_port_forward_server() -> Result<(), Box<dyn std::error::Error>> {
+    info!("CRI port-forward server not available on non-Linux guest platform");
+    Ok(())
 }
 
 fn connect_control() -> io::Result<std::fs::File> {

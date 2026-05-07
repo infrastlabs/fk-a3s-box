@@ -37,7 +37,10 @@ impl AmdKdsClient {
     ///   If `None`, certificates are fetched on every request.
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("failed to build AMD KDS HTTP client"),
             cache_dir,
         }
     }

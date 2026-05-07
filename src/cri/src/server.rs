@@ -16,7 +16,7 @@ use a3s_box_runtime::oci::{ImageStore, RegistryAuth};
 use crate::cri_api::image_service_server::ImageServiceServer;
 use crate::cri_api::runtime_service_server::RuntimeServiceServer;
 use crate::image_service::BoxImageService;
-use crate::runtime_service::BoxRuntimeService;
+use crate::runtime_service::{BoxRuntimeService, CriRuntimeOptions};
 use crate::streaming::StreamingServer;
 
 /// CRI gRPC server configuration.
@@ -29,6 +29,8 @@ pub struct CriServer {
     auth: RegistryAuth,
     /// Streaming server bind address.
     streaming_addr: SocketAddr,
+    /// Runtime-level CRI defaults and RuntimeClass overrides.
+    runtime_options: CriRuntimeOptions,
 }
 
 /// Default streaming server bind address.
@@ -42,6 +44,7 @@ impl CriServer {
             image_store,
             auth,
             streaming_addr: SocketAddr::from(DEFAULT_STREAMING_ADDR),
+            runtime_options: CriRuntimeOptions::default(),
         }
     }
 
@@ -51,8 +54,14 @@ impl CriServer {
         self
     }
 
+    /// Set runtime-level CRI defaults and RuntimeClass image overrides.
+    pub fn with_runtime_options(mut self, options: CriRuntimeOptions) -> Self {
+        self.runtime_options = options;
+        self
+    }
+
     /// Start serving CRI RPCs on the Unix socket.
-    pub async fn serve(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn serve(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Remove existing socket file if present
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path)?;
@@ -64,7 +73,7 @@ impl CriServer {
         }
 
         // Start streaming server
-        let streaming_server = StreamingServer::new(self.streaming_addr);
+        let streaming_server = StreamingServer::new(self.streaming_addr).bind().await?;
         let streaming_handle = streaming_server.handle();
 
         tokio::spawn(async move {
@@ -77,7 +86,8 @@ impl CriServer {
             self.image_store.clone(),
             self.auth.clone(),
             streaming_handle,
-        );
+        )
+        .with_runtime_options(self.runtime_options.clone());
         runtime_service.load_state().await;
         let image_service = BoxImageService::new(self.image_store.clone(), self.auth.clone());
 
