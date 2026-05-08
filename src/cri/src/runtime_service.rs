@@ -3926,6 +3926,19 @@ mod tests {
         pty_socket_path: PathBuf,
     }
 
+    fn tempdir_for_unix_socket(prefix: &str) -> tempfile::TempDir {
+        let base = if Path::new("/private/tmp").exists() {
+            Path::new("/private/tmp")
+        } else {
+            Path::new("/tmp")
+        };
+
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(base)
+            .unwrap()
+    }
+
     fn bind_test_exec_listener(path: &Path) -> Option<UnixListener> {
         match UnixListener::bind(path) {
             Ok(listener) => Some(listener),
@@ -3951,10 +3964,7 @@ mod tests {
     where
         F: FnOnce(&a3s_box_core::exec::ExecRequest) + Send + 'static,
     {
-        let tmp = tempfile::Builder::new()
-            .prefix("a3s-cri-exec-test")
-            .tempdir_in("/private/tmp")
-            .unwrap();
+        let tmp = tempdir_for_unix_socket("a3s-cri-exec-test");
         let socket_path = tmp.path().join("exec.sock");
         let Some(listener) = bind_test_exec_listener(&socket_path) else {
             return None;
@@ -4047,10 +4057,7 @@ mod tests {
     async fn spawn_multi_exec_stream_server(
         expected: Vec<(&'static str, &'static [u8], i32, Duration)>,
     ) -> Option<TestExecServer> {
-        let tmp = tempfile::Builder::new()
-            .prefix("a3s-cri-multi-exec-test")
-            .tempdir_in("/private/tmp")
-            .unwrap();
+        let tmp = tempdir_for_unix_socket("a3s-cri-multi-exec-test");
         let socket_path = tmp.path().join("exec.sock");
         let Some(listener) = bind_test_exec_listener(&socket_path) else {
             return None;
@@ -4126,10 +4133,7 @@ mod tests {
     where
         F: FnOnce(&a3s_box_core::pty::PtyRequest) + Send + 'static,
     {
-        let tmp = tempfile::Builder::new()
-            .prefix("a3s-cri-pty-test")
-            .tempdir_in("/private/tmp")
-            .unwrap();
+        let tmp = tempdir_for_unix_socket("a3s-cri-pty-test");
         let exec_socket_path = tmp.path().join("exec.sock");
         let pty_socket_path = tmp.path().join("pty.sock");
         let Some(listener) = bind_test_exec_listener(&pty_socket_path) else {
@@ -4182,10 +4186,7 @@ mod tests {
     }
 
     async fn spawn_cancelable_exec_stream_server() -> Option<TestExecServer> {
-        let tmp = tempfile::Builder::new()
-            .prefix("a3s-cri-exec-cancel-test")
-            .tempdir_in("/private/tmp")
-            .unwrap();
+        let tmp = tempdir_for_unix_socket("a3s-cri-exec-cancel-test");
         let socket_path = tmp.path().join("exec.sock");
         let Some(listener) = bind_test_exec_listener(&socket_path) else {
             return None;
