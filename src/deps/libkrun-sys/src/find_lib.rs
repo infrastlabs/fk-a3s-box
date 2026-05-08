@@ -57,11 +57,15 @@ pub fn has_exact_library(dir: &Path, name: &str) -> bool {
                 let Some(rest) = filename_str.strip_prefix(&prefix) else {
                     return false;
                 };
-                // Accept if rest equals extension (unversioned) or starts with
-                // '.' and ends with extension (versioned, e.g. libkrun.so.1)
-                extensions
-                    .iter()
-                    .any(|ext| rest == *ext || (rest.starts_with('.') && rest.ends_with(ext)))
+                // Accept unversioned names like `libkrun.so` and versioned
+                // names like `libkrun.so.1` without matching siblings such as
+                // `libkrun-efi.so`.
+                extensions.iter().any(|ext| {
+                    let suffix = format!(".{ext}");
+                    rest == suffix
+                        || rest.starts_with(&format!("{suffix}."))
+                        || (rest.starts_with('.') && rest.ends_with(&suffix))
+                })
             })
         })
         .unwrap_or(false)
