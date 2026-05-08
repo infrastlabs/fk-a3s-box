@@ -289,6 +289,12 @@ Published ports currently support TCP only in `host_port:guest_port[/tcp]`
 form. UDP, bind-specific host IPs such as `127.0.0.1:8080:80`, single-port
 shorthand, and port ranges fail during CLI or Compose validation.
 
+`a3s-box info` reports the selected bridge backend and NAT boundary. Linux uses
+`passt` for peer networking and outbound NAT. macOS uses the built-in
+`netproxy` backend for peer networking and published TCP ports; bridge-mode
+outbound NAT is currently reported as unsupported. Use default TSI networking
+when a macOS box needs outbound internet access.
+
 ### Volumes
 
 ```bash

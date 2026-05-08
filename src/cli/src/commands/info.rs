@@ -13,6 +13,7 @@ pub struct InfoArgs;
 
 pub async fn execute(_args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("a3s-box version {}", a3s_box_core::VERSION);
+    let capabilities = a3s_box_core::PlatformCapabilities::current();
 
     // Virtualization support
     match a3s_box_runtime::check_virtualization_support() {
@@ -27,6 +28,7 @@ pub async fn execute(_args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> 
     // Home directory
     let home = a3s_box_core::dirs_home();
     println!("Home directory: {}", home.display());
+    print_capabilities(&capabilities);
 
     // Box count
     match StateFile::load_default() {
@@ -64,6 +66,40 @@ pub async fn execute(_args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     Ok(())
+}
+
+fn print_capabilities(capabilities: &a3s_box_core::PlatformCapabilities) {
+    println!(
+        "Host platform: {}/{}",
+        capabilities.os, capabilities.architecture
+    );
+    println!("VM backend: {}", capabilities.vm_backend);
+    println!("Control channel: {}", capabilities.host_guest_channel);
+    println!(
+        "Bridge networking: {}",
+        capabilities.bridge_networking_summary()
+    );
+    println!(
+        "Published ports: {}",
+        if capabilities.published_ports {
+            "tcp"
+        } else {
+            "unsupported"
+        }
+    );
+    println!(
+        "TEE: attestation {}, sealed storage {}",
+        availability(capabilities.tee_attestation),
+        availability(capabilities.sealed_storage)
+    );
+}
+
+fn availability(value: bool) -> &'static str {
+    if value {
+        "available"
+    } else {
+        "unavailable"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,5 +161,11 @@ mod tests {
                 paused: 1,
             }
         );
+    }
+
+    #[test]
+    fn test_availability_labels() {
+        assert_eq!(availability(true), "available");
+        assert_eq!(availability(false), "unavailable");
     }
 }

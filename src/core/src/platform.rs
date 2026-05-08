@@ -135,6 +135,10 @@ pub struct PlatformCapabilities {
     pub named_pipes: bool,
     /// Whether the native network proxy is available.
     pub netproxy: bool,
+    /// Bridge network backend available on this host.
+    pub bridge_network_backend: BridgeNetworkBackend,
+    /// Whether user-defined bridge networks can provide guest outbound NAT.
+    pub bridge_outbound_nat: bool,
     /// Whether published ports can be bridged on this host.
     pub published_ports: bool,
     /// Whether TEE attestation is available in the native runtime.
@@ -157,6 +161,16 @@ pub enum VmBackend {
     Unsupported,
 }
 
+impl fmt::Display for VmBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Krun => write!(f, "krun"),
+            Self::WslLauncher => write!(f, "wsl-launcher"),
+            Self::Unsupported => write!(f, "unsupported"),
+        }
+    }
+}
+
 /// Host/guest control transport available on the current host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -167,6 +181,38 @@ pub enum HostGuestChannel {
     NamedPipe,
     /// No supported channel.
     Unsupported,
+}
+
+impl fmt::Display for HostGuestChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnixSocket => write!(f, "unix-socket"),
+            Self::NamedPipe => write!(f, "named-pipe"),
+            Self::Unsupported => write!(f, "unsupported"),
+        }
+    }
+}
+
+/// User-defined bridge network backend selected for the current host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BridgeNetworkBackend {
+    /// Linux `passt` backend.
+    Passt,
+    /// macOS pure-Rust vfkit netproxy backend.
+    Netproxy,
+    /// No bridge backend is available.
+    Unsupported,
+}
+
+impl fmt::Display for BridgeNetworkBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Passt => write!(f, "passt"),
+            Self::Netproxy => write!(f, "netproxy"),
+            Self::Unsupported => write!(f, "unsupported"),
+        }
+    }
 }
 
 impl PlatformCapabilities {
@@ -182,6 +228,8 @@ impl PlatformCapabilities {
             unix_sockets: cfg!(unix),
             named_pipes: cfg!(windows),
             netproxy: cfg!(target_os = "macos"),
+            bridge_network_backend: current_bridge_network_backend(),
+            bridge_outbound_nat: cfg!(target_os = "linux"),
             published_ports: cfg!(unix) || cfg!(windows),
             tee_attestation: cfg!(unix),
             sealed_storage: cfg!(unix),
@@ -197,6 +245,24 @@ impl PlatformCapabilities {
     /// Whether the host has a supported control channel.
     pub fn supports_host_guest_channel(&self) -> bool {
         self.host_guest_channel != HostGuestChannel::Unsupported
+    }
+
+    /// Whether user-defined bridge networking is available.
+    pub fn supports_bridge_networking(&self) -> bool {
+        self.bridge_network_backend != BridgeNetworkBackend::Unsupported
+    }
+
+    /// Human-readable bridge networking mode summary for diagnostics.
+    pub fn bridge_networking_summary(&self) -> String {
+        match self.bridge_network_backend {
+            BridgeNetworkBackend::Passt => {
+                "passt (peer networking and outbound NAT supported)".to_string()
+            }
+            BridgeNetworkBackend::Netproxy => {
+                "netproxy (peer networking supported; outbound NAT unsupported)".to_string()
+            }
+            BridgeNetworkBackend::Unsupported => "unsupported".to_string(),
+        }
     }
 }
 
@@ -228,6 +294,21 @@ fn current_host_guest_channel() -> HostGuestChannel {
 #[cfg(not(any(unix, windows)))]
 fn current_host_guest_channel() -> HostGuestChannel {
     HostGuestChannel::Unsupported
+}
+
+#[cfg(target_os = "linux")]
+fn current_bridge_network_backend() -> BridgeNetworkBackend {
+    BridgeNetworkBackend::Passt
+}
+
+#[cfg(target_os = "macos")]
+fn current_bridge_network_backend() -> BridgeNetworkBackend {
+    BridgeNetworkBackend::Netproxy
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn current_bridge_network_backend() -> BridgeNetworkBackend {
+    BridgeNetworkBackend::Unsupported
 }
 
 /// Normalize architecture names to OCI conventions.
@@ -383,6 +464,7 @@ mod tests {
             assert!(capabilities.unix_sockets);
             assert!(!capabilities.named_pipes);
             assert!(capabilities.supports_native_vm());
+            assert!(capabilities.supports_bridge_networking());
         }
 
         #[cfg(windows)]
@@ -394,5 +476,24 @@ mod tests {
             assert!(capabilities.supports_native_vm());
             assert!(!capabilities.interactive_pty);
         }
+    }
+
+    #[test]
+    fn test_platform_capability_display_values() {
+        assert_eq!(VmBackend::Krun.to_string(), "krun");
+        assert_eq!(HostGuestChannel::UnixSocket.to_string(), "unix-socket");
+        assert_eq!(BridgeNetworkBackend::Netproxy.to_string(), "netproxy");
+    }
+
+    #[test]
+    fn test_bridge_networking_summary_documents_nat_boundary() {
+        let mut capabilities = PlatformCapabilities::current();
+        capabilities.bridge_network_backend = BridgeNetworkBackend::Netproxy;
+        capabilities.bridge_outbound_nat = false;
+
+        let summary = capabilities.bridge_networking_summary();
+
+        assert!(summary.contains("netproxy"));
+        assert!(summary.contains("outbound NAT unsupported"));
     }
 }

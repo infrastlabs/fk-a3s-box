@@ -38,7 +38,9 @@ pub use exec::{FileOp, FileRequest, FileResponse};
 pub use exec::{EXEC_VSOCK_PORT, PORT_FWD_VSOCK_PORT};
 pub use network::{IsolationMode, NetworkConfig, NetworkEndpoint, NetworkMode, NetworkPolicy};
 pub use operator::{BoxAutoscaler, BoxAutoscalerSpec, BoxAutoscalerStatus, MetricType};
-pub use platform::{HostGuestChannel, Platform, PlatformCapabilities, VmBackend};
+pub use platform::{
+    BridgeNetworkBackend, HostGuestChannel, Platform, PlatformCapabilities, VmBackend,
+};
 pub use port::{normalize_port_maps, parse_port_mapping, PortMapping, PortProtocol};
 pub use pty::PTY_VSOCK_PORT;
 pub use scale::{

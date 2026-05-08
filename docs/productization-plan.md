@@ -526,6 +526,11 @@ Current notes:
 - Published-port parsing is shared by CLI, persisted `start`, Compose, and
   macOS netproxy, so unsupported UDP/host-IP/range syntax cannot be silently
   treated as a TCP listener or forwarded to libkrun.
+- `a3s-box info` now reports the host platform, VM backend, control channel,
+  bridge-network backend, published-port support, and TEE availability. The
+  diagnostics make the macOS bridge-mode boundary explicit: netproxy supports
+  peer networking and published TCP ports, while outbound NAT remains
+  unsupported; Linux passt reports peer networking with outbound NAT.
 - User-defined bridge networks now reject unsupported drivers and unsupported
   strict/custom policy modes before persistence, preventing false isolation
   claims until packet filtering is implemented. All attach paths (`run`,
