@@ -4,6 +4,13 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.4] — 2026-05-09
+
+### Changed
+- README and product documentation now describe the verified local CLI runtime,
+  image lifecycle, networking, Compose subset, TEE boundaries, and experimental
+  CRI surface without Docker/Kubernetes overclaiming.
+
 ## [0.8.12] — 2026-03-20
 
 ### Fixed
