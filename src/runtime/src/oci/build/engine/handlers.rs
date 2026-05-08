@@ -108,7 +108,7 @@ pub(super) fn handle_run(
     command: &str,
     rootfs_dir: &Path,
     layers_dir: &Path,
-    #[allow(unused_variables)] workdir: &str,
+    workdir: &str,
     env: &[(String, String)],
     shell: &[String],
     layer_index: usize,
@@ -141,6 +141,9 @@ pub(super) fn handle_run(
     {
         use super::super::layer::DirSnapshot;
 
+        validate_linux_run_preconditions(rootfs_dir, shell, linux_effective_uid())?;
+        let workdir_path = ensure_linux_run_workdir(rootfs_dir, workdir)?;
+
         let before = DirSnapshot::capture(rootfs_dir)?;
 
         // Build the command using the configured shell
@@ -158,6 +161,7 @@ pub(super) fn handle_run(
             cmd.arg("-c");
         }
         cmd.arg(command);
+        cmd.current_dir(&workdir_path);
 
         // Set environment
         cmd.env_clear();
@@ -220,6 +224,72 @@ pub(super) fn handle_run(
             command
         )))
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_run_shell_path(shell: &[String]) -> &str {
+    shell.first().map(String::as_str).unwrap_or("/bin/sh")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_linux_run_preconditions(
+    rootfs_dir: &Path,
+    shell: &[String],
+    effective_uid: u32,
+) -> Result<()> {
+    if effective_uid != 0 {
+        return Err(BoxError::BuildError(
+            "Dockerfile RUN on Linux requires root privileges because the current isolated build path uses chroot. Re-run as root or build on a root-capable builder.".to_string(),
+        ));
+    }
+
+    let shell_path = linux_run_shell_path(shell);
+    if !shell_path.starts_with('/') {
+        return Err(BoxError::BuildError(format!(
+            "Dockerfile RUN shell '{}' is not absolute; SHELL must name an absolute in-rootfs executable",
+            shell_path
+        )));
+    }
+    let shell_in_rootfs = rootfs_dir.join(shell_path.trim_start_matches('/'));
+    if !shell_in_rootfs.exists() {
+        return Err(BoxError::BuildError(format!(
+            "Dockerfile RUN shell '{}' was not found in rootfs at {}; the base image must contain the configured shell",
+            shell_path,
+            shell_in_rootfs.display()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn ensure_linux_run_workdir(rootfs_dir: &Path, workdir: &str) -> Result<PathBuf> {
+    let workdir = if workdir.trim().is_empty() {
+        "/"
+    } else {
+        workdir
+    };
+    if !workdir.starts_with('/') {
+        return Err(BoxError::BuildError(format!(
+            "Dockerfile RUN workdir '{}' is not absolute",
+            workdir
+        )));
+    }
+
+    let workdir_path = rootfs_dir.join(workdir.trim_start_matches('/'));
+    std::fs::create_dir_all(&workdir_path).map_err(|e| {
+        BoxError::BuildError(format!(
+            "Failed to create RUN workdir {}: {}",
+            workdir_path.display(),
+            e
+        ))
+    })?;
+    Ok(workdir_path)
 }
 
 #[cfg(target_os = "macos")]
@@ -903,6 +973,80 @@ mod tests {
         .to_string();
 
         assert!(err.contains("ONBUILD trigger 'RUN echo trigger' is not supported yet"));
+    }
+
+    #[test]
+    fn test_linux_run_shell_path_defaults_to_bin_sh() {
+        assert_eq!(super::linux_run_shell_path(&[]), "/bin/sh");
+        assert_eq!(
+            super::linux_run_shell_path(&["/bin/bash".to_string(), "-c".to_string()]),
+            "/bin/bash"
+        );
+    }
+
+    #[test]
+    fn test_linux_run_preconditions_reject_non_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+        std::fs::write(rootfs.join("bin/sh"), "fake shell").unwrap();
+
+        let err = super::validate_linux_run_preconditions(&rootfs, &[], 1000)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("requires root privileges"));
+    }
+
+    #[test]
+    fn test_linux_run_preconditions_reject_missing_shell() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let err = super::validate_linux_run_preconditions(&rootfs, &[], 0)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("was not found in rootfs"));
+    }
+
+    #[test]
+    fn test_linux_run_preconditions_reject_relative_shell() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let err = super::validate_linux_run_preconditions(&rootfs, &["sh".to_string()], 0)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("is not absolute"));
+    }
+
+    #[test]
+    fn test_ensure_linux_run_workdir_creates_absolute_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let workdir = super::ensure_linux_run_workdir(&rootfs, "/app/build").unwrap();
+
+        assert_eq!(workdir, rootfs.join("app/build"));
+        assert!(workdir.is_dir());
+    }
+
+    #[test]
+    fn test_ensure_linux_run_workdir_rejects_relative_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let err = super::ensure_linux_run_workdir(&rootfs, "app")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("is not absolute"));
     }
 
     #[cfg(target_os = "macos")]

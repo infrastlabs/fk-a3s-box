@@ -294,6 +294,10 @@ Current notes:
 - Dockerfile `RUN` no longer has any silent skip path on unsupported hosts.
   Linux uses isolated `chroot`; macOS fails by default unless the user explicitly
   opts into unsafe host execution with `A3S_BOX_UNSAFE_HOST_RUN=1`.
+- Linux `RUN` now has explicit preflight diagnostics for the chroot path:
+  non-root builders fail before execution with root-capable builder guidance,
+  configured shells must be absolute and present in the rootfs, and the build
+  workdir is created before chroot execution so `RUN` honors `WORKDIR`.
 - CLI build smoke coverage now includes a pure `FROM scratch` build that verifies
   `COPY`, image metadata, history, save/exported layer contents, and local image
   removal without registry or VM access. An ignored Linux-only smoke harness
@@ -322,6 +326,8 @@ Current notes:
   log files and macOS host control sockets use `/private/tmp/a3s-box-sockets` so
   CLI output capture and libkrun Unix-socket bridges do not interfere with
   lifecycle commands.
+- The full ignored `core_smoke` suite has been run with an offline Alpine OCI
+  archive on macOS HVF and all 14 real-runtime tests passed.
 
 ### Gate 4: Kubernetes CRI MVP
 
@@ -577,8 +583,9 @@ Acceptance criteria:
 
 ## Immediate Development Queue
 
-1. Run and harden the Linux-only Dockerfile `RUN` build smoke on a root-capable
-   Linux host with a local Alpine OCI tar.
+1. Run the Linux-only Dockerfile `RUN` build smoke on a root-capable Linux host
+   with a local Alpine OCI tar. The Linux chroot path now has root/shell/workdir
+   preflight checks, but still needs real Linux execution validation.
 2. Split network/host-dependent tests from pure unit tests. The cosign keyless
    registry lookup test is now ignored by default and should be run explicitly
    when registry network access is available.

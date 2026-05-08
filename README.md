@@ -257,9 +257,9 @@ Build subset: `FROM` (including `scratch`), shell-form `RUN`, shell-form
 triggers, and `VOLUME`.
 Unsupported Dockerfile flags fail explicitly; for example `COPY --chown` and
 `ADD --chown` are not silently ignored. Dockerfile `RUN` currently requires
-Linux for isolated execution. On macOS it fails by default rather than executing
-on the host. For local experiments only, set `A3S_BOX_UNSAFE_HOST_RUN=1` to opt
-into unsafe host-side execution.
+root-capable Linux for isolated chroot execution. On macOS it fails by default
+rather than executing on the host. For local experiments only, set
+`A3S_BOX_UNSAFE_HOST_RUN=1` to opt into unsafe host-side execution.
 
 ### Filesystem
 
