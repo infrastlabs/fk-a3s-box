@@ -52,6 +52,51 @@ impl VmManager {
                 hint: None,
             })?;
 
+        // Snapshot restore pre-populates `box_dir/rootfs` with a captured full
+        // root filesystem. Boot directly from it instead of rebuilding from the
+        // image, so the snapshot's filesystem state (including runtime changes)
+        // is preserved. Normal boxes never have `box_dir/rootfs` — the overlay
+        // provider materializes the rootfs at `merged` — so this path only
+        // affects restored boxes and cannot regress the normal boot path.
+        let prebuilt_rootfs = box_dir.join("rootfs");
+        // A restore marker is written by `snapshot restore` next to the copied
+        // rootfs; gating on it (not merely on `rootfs` existing) ensures this
+        // path can never be taken for a normal box that happens to have a
+        // leftover `rootfs` directory from a cache-miss build.
+        let restore_marker = box_dir.join(".snapshot-rootfs");
+        let prebuilt_is_populated = restore_marker.exists()
+            && std::fs::read_dir(&prebuilt_rootfs)
+                .map(|mut it| it.next().is_some())
+                .unwrap_or(false);
+        if prebuilt_is_populated {
+            tracing::info!(
+                rootfs = %prebuilt_rootfs.display(),
+                "Booting from pre-populated rootfs (snapshot restore)"
+            );
+            // Refresh the guest init in case the snapshot carries an older binary
+            // than the current runtime.
+            if let Ok(guest_init_path) = Self::find_guest_init() {
+                if let Err(e) = OciRootfsBuilder::new(&prebuilt_rootfs)
+                    .with_guest_init(guest_init_path)
+                    .install_guest_init_only()
+                {
+                    tracing::warn!(error = %e, "Failed to refresh guest init on restored rootfs");
+                }
+            }
+            let tee_instance_config = self.generate_tee_config(&box_dir)?;
+            return Ok(BoxLayout {
+                rootfs_path: prebuilt_rootfs,
+                exec_socket_path: socket_dir.join("exec.sock"),
+                pty_socket_path: socket_dir.join("pty.sock"),
+                attest_socket_path: socket_dir.join("attest.sock"),
+                port_forward_socket_path: socket_dir.join("portfwd.sock"),
+                workspace_path,
+                console_output: Some(logs_dir.join("console.log")),
+                oci_config: None,
+                tee_instance_config,
+            });
+        }
+
         // Pull OCI image from registry and extract at rootfs root.
         // Extracting at root preserves absolute symlinks and dynamic linker paths.
         let reference = &self.config.image;
@@ -378,22 +423,22 @@ impl VmManager {
     ///
     /// The binary must be a Linux ELF executable since it runs inside the VM.
     pub(crate) fn find_guest_init() -> Result<PathBuf> {
-        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
         let mut candidates = Self::find_binary_candidates("a3s-box-guest-init");
 
-        #[cfg(target_os = "windows")]
-        {
-            candidates.sort_by_key(|path| {
-                let path_str = path.to_string_lossy();
-                if path_str.contains("x86_64-unknown-linux-musl")
-                    || path_str.contains("aarch64-unknown-linux-musl")
-                {
-                    0
-                } else {
-                    1
-                }
-            });
-        }
+        // Prefer the cross-compiled musl-static build over any host build on
+        // ALL platforms. On a Linux x86_64 host, `cargo build --workspace`
+        // produces a glibc-dynamic `target/<profile>/a3s-box-guest-init` next to
+        // the exe; that build cannot run as PID 1 in a minimal guest rootfs, so
+        // the static musl build must win. (`is_linux_elf` also rejects the
+        // glibc build outright, but ranking musl first avoids relying on that.)
+        candidates.sort_by_key(|path| {
+            let path_str = path.to_string_lossy();
+            if path_str.contains("-unknown-linux-musl") {
+                0
+            } else {
+                1
+            }
+        });
 
         for path in candidates {
             if Self::is_linux_elf(&path) {
@@ -408,7 +453,10 @@ impl VmManager {
         Err(BoxError::BoxBootError {
             message: "Linux guest init binary not found".to_string(),
             hint: Some(
-                "Cross-compile with: cargo build -p a3s-box-guest-init --target aarch64-unknown-linux-musl"
+                "Cross-compile the static guest init for your guest arch, e.g.: \
+                 cargo build -p a3s-box-guest-init --release --target x86_64-unknown-linux-musl \
+                 (or aarch64-unknown-linux-musl). A glibc-dynamic host build is rejected because \
+                 it cannot run as PID 1 inside a minimal guest rootfs."
                     .to_string(),
             ),
         })
@@ -482,23 +530,57 @@ impl VmManager {
         candidates
     }
 
-    /// Check if a file is a Linux ELF binary by reading its magic bytes.
+    /// Check if a file is a Linux ELF binary suitable to run as guest PID 1.
+    ///
+    /// Beyond the ELF magic and OS/ABI check, this rejects *dynamically linked*
+    /// ELFs (those carrying a `PT_INTERP` program header). The guest init must
+    /// be a static binary: a glibc-dynamic build cannot resolve its loader/libc
+    /// inside a minimal (musl/Alpine/distroless) guest rootfs and would fail to
+    /// exec as PID 1. A musl static-PIE binary has no `PT_INTERP`, so it passes.
     fn is_linux_elf(path: &std::path::Path) -> bool {
-        let Ok(file) = std::fs::File::open(path) else {
+        let Ok(data) = std::fs::read(path) else {
             return false;
         };
-        use std::io::Read;
-        let mut header = [0u8; 18];
-        let Ok(_) = (&file).read_exact(&mut header) else {
-            return false;
-        };
-        // ELF magic: 0x7f 'E' 'L' 'F'
-        if header[0..4] != [0x7f, b'E', b'L', b'F'] {
+        if data.len() < 64 || data[0..4] != [0x7f, b'E', b'L', b'F'] {
             return false;
         }
-        // EI_OSABI (byte 7): 0x00 = ELFOSABI_NONE (System V / Linux)
-        // or 0x03 = ELFOSABI_LINUX
-        matches!(header[7], 0x00 | 0x03)
+        // EI_OSABI: 0x00 = System V / Linux, 0x03 = Linux.
+        if !matches!(data[7], 0x00 | 0x03) {
+            return false;
+        }
+
+        // Only parse program headers for the common ELF64 little-endian case
+        // (x86_64/aarch64). For other classes/endianness, accept on magic+ABI
+        // rather than risk a false negative on an exotic-but-valid target.
+        let is_elf64 = data[4] == 2;
+        let is_le = data[5] == 1;
+        if !is_elf64 || !is_le {
+            return true;
+        }
+
+        let u16_at = |off: usize| u16::from_le_bytes([data[off], data[off + 1]]);
+        let u64_at =
+            |off: usize| u64::from_le_bytes(data[off..off + 8].try_into().unwrap_or([0; 8]));
+        let e_phoff = u64_at(0x20) as usize; // program header table offset
+        let e_phentsize = u16_at(0x36) as usize;
+        let e_phnum = u16_at(0x38) as usize;
+        if e_phoff == 0 || e_phentsize < 4 {
+            return true; // no usable program headers → accept on magic+ABI
+        }
+
+        const PT_INTERP: u32 = 3;
+        for i in 0..e_phnum {
+            let ph = e_phoff + i * e_phentsize;
+            if ph + 4 > data.len() {
+                break;
+            }
+            let p_type = u32::from_le_bytes(data[ph..ph + 4].try_into().unwrap_or([0; 4]));
+            if p_type == PT_INTERP {
+                // Dynamically linked: unsafe as guest PID 1.
+                return false;
+            }
+        }
+        true
     }
 }
 
