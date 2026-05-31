@@ -32,21 +32,12 @@ pub struct PullArgs {
 
 pub async fn execute(args: PullArgs) -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(super::open_image_store()?);
-    let config = a3s_box_core::A3sConfig::load_default()?;
-    let default_registry = config.registry.default_image_registry();
 
     // Parse reference to determine registry for credential lookup
-    let reference = a3s_box_runtime::ImageReference::parse_with_default_registry(
-        &args.image,
-        &default_registry,
-    )?;
+    let reference = a3s_box_runtime::ImageReference::parse(&args.image)?;
     let auth = a3s_box_runtime::RegistryAuth::from_credential_store(&reference.registry);
 
-    let mut puller =
-        a3s_box_runtime::ImagePuller::new(store, auth).with_default_registry(&default_registry);
-    if let Some(platform) = args.platform.as_deref() {
-        puller = puller.with_platform(platform)?;
-    }
+    let mut puller = a3s_box_runtime::ImagePuller::new(store, auth);
 
     // Configure signature verification policy
     let policy = if let Some(ref key_path) = args.verify_key {
@@ -94,8 +85,7 @@ pub async fn execute(args: PullArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }));
     }
-    let full_reference = reference.full_reference();
-    let image = puller.pull(&full_reference).await?;
+    let image = puller.pull(&args.image).await?;
 
     if args.quiet {
         println!("{}", image.root_dir().display());

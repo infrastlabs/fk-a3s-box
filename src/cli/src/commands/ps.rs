@@ -4,6 +4,7 @@ use clap::Args;
 
 use crate::output;
 use crate::state::{BoxRecord, StateFile};
+use crate::status;
 
 #[derive(Args)]
 pub struct PsArgs {
@@ -14,18 +15,6 @@ pub struct PsArgs {
     /// Only display box IDs
     #[arg(short, long)]
     pub quiet: bool,
-
-    /// Show full box IDs
-    #[arg(long)]
-    pub no_trunc: bool,
-
-    /// Show the latest created box (includes non-running boxes)
-    #[arg(short = 'l', long)]
-    pub latest: bool,
-
-    /// Show the last N created boxes (includes non-running boxes)
-    #[arg(short = 'n', long, value_name = "N")]
-    pub last: Option<usize>,
 
     /// Format output using placeholders: {{.ID}}, {{.Image}}, {{.Status}},
     /// {{.Created}}, {{.Names}}, {{.Ports}}, {{.Command}}
@@ -39,22 +28,18 @@ pub struct PsArgs {
 
 pub async fn execute(args: PsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let state = StateFile::load_default()?;
-    let boxes = state.list(args.all || args.latest || args.last.is_some());
+    let boxes = select_records(&state, args.all);
 
     // Apply filters
-    let boxes: Vec<&BoxRecord> = select_recent_boxes(
-        boxes
-            .into_iter()
-            .filter(|record| matches_filters(record, &args.filters))
-            .collect(),
-        args.latest,
-        args.last,
-    );
+    let boxes: Vec<&BoxRecord> = boxes
+        .into_iter()
+        .filter(|r| matches_filters(r, &args.filters))
+        .collect();
 
     // --quiet: print only IDs
     if args.quiet {
         for record in &boxes {
-            println!("{}", display_id(record, args.no_trunc));
+            println!("{}", record.short_id);
         }
         return Ok(());
     }
@@ -62,7 +47,7 @@ pub async fn execute(args: PsArgs) -> Result<(), Box<dyn std::error::Error>> {
     // --format: custom template output
     if let Some(ref fmt) = args.format {
         for record in &boxes {
-            println!("{}", apply_format(record, fmt, args.no_trunc));
+            println!("{}", apply_format(record, fmt));
         }
         return Ok(());
     }
@@ -72,9 +57,9 @@ pub async fn execute(args: PsArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     for record in boxes {
         let ports = record.port_map.join(", ");
-        let status = format_status(record);
+        let status = status::format_status(record);
         table.add_row([
-            &display_id(record, args.no_trunc),
+            &record.short_id,
             &record.image,
             &status,
             &output::format_ago(&record.created_at),
@@ -87,35 +72,10 @@ pub async fn execute(args: PsArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn select_recent_boxes<'a>(
-    mut boxes: Vec<&'a BoxRecord>,
-    latest: bool,
-    last: Option<usize>,
-) -> Vec<&'a BoxRecord> {
-    if !latest && last.is_none() {
-        return boxes;
-    }
-
-    boxes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let limit = if latest { Some(1) } else { last };
-    if let Some(limit) = limit {
-        boxes.truncate(limit);
-    }
-    boxes
-}
-
-fn display_id(record: &BoxRecord, no_trunc: bool) -> String {
-    if no_trunc {
-        record.id.clone()
-    } else {
-        record.short_id.clone()
-    }
-}
-
 /// Check if a box record matches all the given filters.
 ///
 /// Supported filters:
-/// - `status=<value>` — match box status (running, stopped, created, dead)
+/// - `status=<value>` — match box status (created, running, paused, stopped, dead)
 /// - `name=<value>` — match box name (substring)
 /// - `ancestor=<value>` — match image reference (substring)
 /// - `id=<value>` — match box ID prefix
@@ -142,11 +102,23 @@ fn matches_filters(record: &BoxRecord, filters: &[String]) -> bool {
     true
 }
 
+fn select_records(state: &StateFile, all: bool) -> Vec<&BoxRecord> {
+    let records = state.list(true);
+    if all {
+        return records;
+    }
+
+    records
+        .into_iter()
+        .filter(|record| status::is_default_ps_visible(record))
+        .collect()
+}
+
 /// Apply a format template, replacing `{{.Field}}` placeholders.
-fn apply_format(record: &BoxRecord, fmt: &str, no_trunc: bool) -> String {
+fn apply_format(record: &BoxRecord, fmt: &str) -> String {
     let labels_str = format_labels(&record.labels);
-    let status = format_status(record);
-    fmt.replace("{{.ID}}", &display_id(record, no_trunc))
+    let status = status::format_status(record);
+    fmt.replace("{{.ID}}", &record.short_id)
         .replace("{{.Image}}", &record.image)
         .replace("{{.Status}}", &status)
         .replace("{{.Created}}", &output::format_ago(&record.created_at))
@@ -154,31 +126,6 @@ fn apply_format(record: &BoxRecord, fmt: &str, no_trunc: bool) -> String {
         .replace("{{.Command}}", &record.cmd.join(" "))
         .replace("{{.Ports}}", &record.port_map.join(", "))
         .replace("{{.Labels}}", &labels_str)
-}
-
-/// Format box status with health and restart annotations.
-///
-/// Examples:
-/// - "running" (no health check, no restarts)
-/// - "running (healthy)" (health check active)
-/// - "running (Restarting: 3)" (has been restarted)
-/// - "running (healthy, Restarting: 3)" (both)
-fn format_status(record: &BoxRecord) -> String {
-    let mut annotations = Vec::new();
-
-    if record.health_check.is_some() && record.health_status != "none" {
-        annotations.push(record.health_status.clone());
-    }
-
-    if record.restart_count > 0 {
-        annotations.push(format!("Restarting: {}", record.restart_count));
-    }
-
-    if annotations.is_empty() {
-        record.status.clone()
-    } else {
-        format!("{} ({})", record.status, annotations.join(", "))
-    }
 }
 
 /// Check if a box's labels match a label filter value.
@@ -243,6 +190,7 @@ mod tests {
             max_restart_count: 0,
             exit_code: None,
             health_check: None,
+            healthcheck_disabled: false,
             health_status: "none".to_string(),
             health_retries: 0,
             health_last_check: None,
@@ -269,52 +217,6 @@ mod tests {
             oom_kill_disable: false,
             oom_score_adj: None,
         }
-    }
-
-    // --- Docker-compatible listing options ---
-
-    #[test]
-    fn test_display_id_truncates_by_default() {
-        let record = make_record("box1", "running", HashMap::new());
-
-        assert_eq!(display_id(&record, false), record.short_id);
-        assert_eq!(display_id(&record, true), record.id);
-    }
-
-    #[test]
-    fn test_apply_format_no_trunc_id() {
-        let record = make_record("box1", "running", HashMap::new());
-
-        assert_eq!(apply_format(&record, "{{.ID}}", true), record.id);
-    }
-
-    #[test]
-    fn test_select_recent_boxes_latest() {
-        let mut oldest = make_record("oldest", "stopped", HashMap::new());
-        let mut newest = make_record("newest", "stopped", HashMap::new());
-        oldest.created_at = chrono::Utc::now() - chrono::Duration::seconds(30);
-        newest.created_at = chrono::Utc::now();
-
-        let selected = select_recent_boxes(vec![&oldest, &newest], true, None);
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].name, "newest");
-    }
-
-    #[test]
-    fn test_select_recent_boxes_last_n() {
-        let mut one = make_record("one", "stopped", HashMap::new());
-        let mut two = make_record("two", "stopped", HashMap::new());
-        let mut three = make_record("three", "stopped", HashMap::new());
-        one.created_at = chrono::Utc::now() - chrono::Duration::seconds(30);
-        two.created_at = chrono::Utc::now() - chrono::Duration::seconds(20);
-        three.created_at = chrono::Utc::now() - chrono::Duration::seconds(10);
-
-        let selected = select_recent_boxes(vec![&one, &two, &three], false, Some(2));
-
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].name, "three");
-        assert_eq!(selected[1].name, "two");
     }
 
     // --- match_label tests ---
@@ -422,7 +324,7 @@ mod tests {
         let mut labels = HashMap::new();
         labels.insert("env".to_string(), "prod".to_string());
         let record = make_record("box1", "running", labels);
-        let result = apply_format(&record, "{{.Names}} {{.Labels}}", false);
+        let result = apply_format(&record, "{{.Names}} {{.Labels}}");
         assert!(result.contains("box1"));
         assert!(result.contains("env=prod"));
     }
@@ -430,7 +332,7 @@ mod tests {
     #[test]
     fn test_apply_format_labels_empty() {
         let record = make_record("box1", "running", HashMap::new());
-        let result = apply_format(&record, "{{.Labels}}", false);
+        let result = apply_format(&record, "{{.Labels}}");
         assert_eq!(result, "");
     }
 
@@ -441,6 +343,13 @@ mod tests {
         let record = make_record("box1", "running", HashMap::new());
         assert!(matches_filters(&record, &["status=running".to_string()]));
         assert!(!matches_filters(&record, &["status=stopped".to_string()]));
+    }
+
+    #[test]
+    fn test_filter_status_paused() {
+        let record = make_record("box1", "paused", HashMap::new());
+        assert!(matches_filters(&record, &["status=paused".to_string()]));
+        assert!(!matches_filters(&record, &["status=running".to_string()]));
     }
 
     #[test]
@@ -474,7 +383,7 @@ mod tests {
     #[test]
     fn test_format_status_no_health_check() {
         let record = make_record("box1", "running", HashMap::new());
-        assert_eq!(format_status(&record), "running");
+        assert_eq!(status::format_status(&record), "running");
     }
 
     #[test]
@@ -488,7 +397,7 @@ mod tests {
             start_period_secs: 0,
         });
         record.health_status = "healthy".to_string();
-        assert_eq!(format_status(&record), "running (healthy)");
+        assert_eq!(status::format_status(&record), "running (healthy)");
     }
 
     #[test]
@@ -502,7 +411,7 @@ mod tests {
             start_period_secs: 0,
         });
         record.health_status = "unhealthy".to_string();
-        assert_eq!(format_status(&record), "running (unhealthy)");
+        assert_eq!(status::format_status(&record), "running (unhealthy)");
     }
 
     #[test]
@@ -516,7 +425,7 @@ mod tests {
             start_period_secs: 0,
         });
         record.health_status = "starting".to_string();
-        assert_eq!(format_status(&record), "running (starting)");
+        assert_eq!(status::format_status(&record), "running (starting)");
     }
 
     #[test]
@@ -531,7 +440,7 @@ mod tests {
         });
         record.health_status = "none".to_string();
         // "none" should not be shown
-        assert_eq!(format_status(&record), "running");
+        assert_eq!(status::format_status(&record), "running");
     }
 
     // --- Restart count in status tests ---
@@ -540,14 +449,14 @@ mod tests {
     fn test_format_status_with_restart_count() {
         let mut record = make_record("box1", "running", HashMap::new());
         record.restart_count = 3;
-        assert_eq!(format_status(&record), "running (Restarting: 3)");
+        assert_eq!(status::format_status(&record), "running (Restarts: 3)");
     }
 
     #[test]
     fn test_format_status_restart_count_zero_not_shown() {
         let mut record = make_record("box1", "running", HashMap::new());
         record.restart_count = 0;
-        assert_eq!(format_status(&record), "running");
+        assert_eq!(status::format_status(&record), "running");
     }
 
     #[test]
@@ -562,6 +471,9 @@ mod tests {
         });
         record.health_status = "healthy".to_string();
         record.restart_count = 2;
-        assert_eq!(format_status(&record), "running (healthy, Restarting: 2)");
+        assert_eq!(
+            status::format_status(&record),
+            "running (healthy, Restarts: 2)"
+        );
     }
 }

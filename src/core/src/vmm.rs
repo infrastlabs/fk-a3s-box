@@ -115,6 +115,10 @@ pub struct InstanceSpec {
     #[serde(default)]
     pub attest_socket_path: PathBuf,
 
+    /// Path to the Unix socket for CRI port-forward control
+    #[serde(default)]
+    pub port_forward_socket_path: PathBuf,
+
     /// Filesystem mounts (virtio-fs shares)
     pub fs_mounts: Vec<FsMount>,
 
@@ -159,6 +163,7 @@ impl Default for InstanceSpec {
             exec_socket_path: PathBuf::new(),
             pty_socket_path: PathBuf::new(),
             attest_socket_path: PathBuf::new(),
+            port_forward_socket_path: PathBuf::new(),
             fs_mounts: Vec::new(),
             entrypoint: Entrypoint {
                 executable: String::new(),
@@ -334,6 +339,7 @@ mod tests {
             exec_socket_path: PathBuf::from("/tmp/exec.sock"),
             pty_socket_path: PathBuf::from("/tmp/pty.sock"),
             attest_socket_path: PathBuf::from("/tmp/attest.sock"),
+            port_forward_socket_path: PathBuf::from("/tmp/portfwd.sock"),
             fs_mounts: vec![FsMount {
                 tag: "workspace".to_string(),
                 host_path: PathBuf::from("/home/user/project"),
@@ -366,6 +372,10 @@ mod tests {
         assert_eq!(deserialized.entrypoint.executable, "/usr/bin/agent");
         assert_eq!(deserialized.entrypoint.args.len(), 2);
         assert_eq!(deserialized.entrypoint.env.len(), 1);
+        assert_eq!(
+            deserialized.port_forward_socket_path,
+            PathBuf::from("/tmp/portfwd.sock")
+        );
         assert_eq!(deserialized.port_map, vec!["8080:80"]);
         assert_eq!(deserialized.user, Some("1000:1000".to_string()));
     }

@@ -23,14 +23,19 @@ pub struct PasstManager {
 impl PasstManager {
     /// Create a new PasstManager.
     ///
-    /// The socket and PID file are placed under the box's sockets directory:
-    /// `~/.a3s/boxes/<box_id>/sockets/passt.sock`
-    /// `~/.a3s/boxes/<box_id>/sockets/passt.pid`
-    pub fn new(box_dir: &Path) -> Self {
-        let sockets_dir = box_dir.join("sockets");
+    /// The socket and PID file are placed directly in the provided runtime
+    /// socket directory (the same directory that holds the exec/PTY control
+    /// sockets, e.g. `/tmp/a3s-box-sockets/<box_id>`).
+    ///
+    /// This directory MUST be reachable by the user passt runs as. When passt
+    /// is started as root it drops privileges to `nobody`, so the socket
+    /// directory has to be world-traversable — the box's `~/.a3s/boxes/<id>`
+    /// home is mode 0700 for root and would leave passt unable to bind its
+    /// socket, silently breaking all bridge networking and Compose.
+    pub fn new(socket_dir: &Path) -> Self {
         Self {
-            socket_path: sockets_dir.join("passt.sock"),
-            pid_file: sockets_dir.join("passt.pid"),
+            socket_path: socket_dir.join("passt.sock"),
+            pid_file: socket_dir.join("passt.pid"),
             child: None,
         }
     }
@@ -47,14 +52,16 @@ impl PasstManager {
     /// - The assigned IP, gateway, prefix length
     /// - DNS forwarding
     /// - No DHCP (static IP assignment)
+    /// - Inbound TCP port forwarding for any published ports (`port_map`)
     pub fn spawn(
         &mut self,
         ip: Ipv4Addr,
         gateway: Ipv4Addr,
         prefix_len: u8,
         dns_servers: &[Ipv4Addr],
+        port_map: &[String],
     ) -> Result<()> {
-        // Ensure parent directory exists
+        // Ensure parent directory exists.
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 BoxError::NetworkError(format!(
@@ -63,6 +70,26 @@ impl PasstManager {
                     e
                 ))
             })?;
+
+            // passt drops privileges to `nobody` when launched as root, so the
+            // directory it binds its socket (and writes its PID file) in must be
+            // writable by that user. Widen the directory permissions; the path
+            // is an ephemeral, per-box runtime directory under a world-traversable
+            // base, so this only affects this box's control sockets.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777))
+                {
+                    tracing::warn!(
+                        dir = %parent.display(),
+                        error = %e,
+                        "Failed to widen passt socket directory permissions; \
+                         passt may be unable to bind its socket after dropping privileges"
+                    );
+                }
+            }
         }
 
         // Remove stale socket if it exists
@@ -90,9 +117,40 @@ impl PasstManager {
             cmd.arg("--dns").arg(dns.to_string());
         }
 
-        // Suppress stdout/stderr to avoid noise
-        cmd.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+        // Forward published TCP ports into the guest. libkrun discards the
+        // TSI host_port_map once a virtio-net device is attached, so passt is
+        // what actually publishes `-p host:guest` in bridge mode. Auto-assigned
+        // host ports (host_port == 0) cannot be forwarded by passt and are
+        // skipped. passt accepts a comma-separated `host:guest,...` spec.
+        let tcp_specs: Vec<String> = port_map
+            .iter()
+            .filter_map(|m| a3s_box_core::parse_port_mapping(m).ok())
+            .filter(|m| m.host_port != 0)
+            .map(|m| format!("{}:{}", m.host_port, m.guest_port))
+            .collect();
+        if !tcp_specs.is_empty() {
+            let spec = tcp_specs.join(",");
+            tracing::info!(tcp_ports = %spec, "Configuring passt inbound TCP port forwarding");
+            cmd.arg("--tcp-ports").arg(spec);
+        }
+
+        // Capture passt's stderr to a log file so spawn failures (bad args,
+        // unsupported flags, permission errors after dropping privileges) are
+        // diagnosable instead of silently discarded to /dev/null.
+        cmd.stdout(std::process::Stdio::null());
+        match self
+            .socket_path
+            .parent()
+            .map(|p| p.join("passt.stderr.log"))
+            .and_then(|p| std::fs::File::create(p).ok())
+        {
+            Some(file) => {
+                cmd.stderr(std::process::Stdio::from(file));
+            }
+            None => {
+                cmd.stderr(std::process::Stdio::null());
+            }
+        }
 
         let child = cmd.spawn().map_err(|e| {
             BoxError::NetworkError(format!(
@@ -118,18 +176,45 @@ impl PasstManager {
     }
 
     /// Wait for the passt socket to become available.
-    fn wait_for_socket(&self) -> Result<()> {
+    ///
+    /// Also detects immediate passt exit (e.g. bad args or a permission failure
+    /// after dropping privileges) so the real cause is surfaced instead of a
+    /// misleading 5-second timeout.
+    fn wait_for_socket(&mut self) -> Result<()> {
+        let stderr_path = self.socket_path.parent().map(|p| p.join("passt.stderr.log"));
+        let read_stderr = |path: &Option<PathBuf>| -> String {
+            path.as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| {
+                    let mut tail: Vec<&str> = s.lines().rev().take(4).collect();
+                    tail.reverse();
+                    tail.join("; ")
+                })
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!(" (passt stderr: {s})"))
+                .unwrap_or_default()
+        };
+
         let max_attempts = 50; // 5 seconds total
         for _ in 0..max_attempts {
             if self.socket_path.exists() {
                 return Ok(());
             }
+            if let Some(child) = self.child.as_mut() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(BoxError::NetworkError(format!(
+                        "passt exited early with {status} before creating its socket{}",
+                        read_stderr(&stderr_path)
+                    )));
+                }
+            }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
         Err(BoxError::NetworkError(format!(
-            "passt socket {} did not appear within 5 seconds",
-            self.socket_path.display()
+            "passt socket {} did not appear within 5 seconds{}",
+            self.socket_path.display(),
+            read_stderr(&stderr_path)
         )))
     }
 
@@ -163,8 +248,36 @@ impl PasstManager {
 
 impl Drop for PasstManager {
     fn drop(&mut self) {
-        self.stop();
+        // Intentionally does NOT kill passt. passt must outlive the process that
+        // spawned it: a detached `run -d` returns while the box keeps running,
+        // and the VM (driven by the shim) outlives the CLI. Killing on drop here
+        // is exactly what previously left detached bridge boxes with dead
+        // networking. passt is reaped on box stop/rm via `terminate_passt`, which
+        // uses the PID file as the source of truth.
     }
+}
+
+/// Terminate a passt daemon by its PID file and remove its socket/PID files.
+///
+/// passt outlives the `PasstManager` that launched it (so detached boxes keep
+/// working after the CLI exits), so box teardown cannot rely on a live handle —
+/// the PID file written into the box's runtime socket directory is authoritative.
+pub fn terminate_passt(socket_dir: &Path) {
+    let pid_file = socket_dir.join("passt.pid");
+    if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+        if let Ok(pid) = contents.trim().parse::<i32>() {
+            if pid > 1 {
+                // SIGTERM; passt exits and is reaped by its (re)parent.
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+                tracing::info!(pid, "Terminated passt daemon");
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&pid_file);
+    let _ = std::fs::remove_file(socket_dir.join("passt.sock"));
 }
 
 impl super::NetworkBackend for PasstManager {
@@ -204,10 +317,7 @@ mod tests {
     fn test_passt_manager_new() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = PasstManager::new(dir.path());
-        assert_eq!(
-            mgr.socket_path(),
-            dir.path().join("sockets").join("passt.sock")
-        );
+        assert_eq!(mgr.socket_path(), dir.path().join("passt.sock"));
     }
 
     #[test]
@@ -231,27 +341,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let box_dir = dir.path().join("boxes").join("test-box-id");
         let mgr = PasstManager::new(&box_dir);
-        assert_eq!(
-            mgr.socket_path(),
-            box_dir.join("sockets").join("passt.sock")
-        );
+        assert_eq!(mgr.socket_path(), box_dir.join("passt.sock"));
     }
 
     #[test]
-    fn test_passt_manager_drop_cleans_up() {
+    fn test_terminate_passt_removes_socket_and_pid_files() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("sockets").join("passt.sock");
-        let pid_path = dir.path().join("sockets").join("passt.pid");
+        let socket_path = dir.path().join("passt.sock");
+        let pid_path = dir.path().join("passt.pid");
 
-        // Create fake socket and pid files
-        std::fs::create_dir_all(dir.path().join("sockets")).unwrap();
+        // A non-existent PID so the SIGTERM is a harmless no-op (ESRCH).
         std::fs::write(&socket_path, "fake").unwrap();
-        std::fs::write(&pid_path, "fake").unwrap();
+        std::fs::write(&pid_path, "2147483647").unwrap();
 
-        {
-            let _mgr = PasstManager::new(dir.path());
-            // Drop triggers cleanup
-        }
+        terminate_passt(dir.path());
 
         assert!(!socket_path.exists());
         assert!(!pid_path.exists());

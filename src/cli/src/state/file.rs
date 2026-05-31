@@ -41,8 +41,16 @@ impl StateFile {
         Self::load(&home.join("boxes.json"))
     }
 
-    /// Save state to disk atomically (write to .tmp, then rename).
+    /// Save state to disk atomically under the cross-process state lock.
     pub fn save(&self) -> Result<(), std::io::Error> {
+        let _lock = super::lock::StateLock::acquire()?;
+        self.write_to_disk()
+    }
+
+    /// Atomic write (tmp + rename) WITHOUT taking the state lock. Callers that
+    /// already hold the lock (`save`, `modify`, and `reconcile` which runs
+    /// inside `load`) use this to avoid re-locking (`flock` is not reentrant).
+    fn write_to_disk(&self) -> Result<(), std::io::Error> {
         let data = serde_json::to_string_pretty(&self.records).map_err(std::io::Error::other)?;
         let tmp_path = self.path.with_extension("json.tmp");
         std::fs::write(&tmp_path, &data)?;
@@ -50,10 +58,59 @@ impl StateFile {
         Ok(())
     }
 
+    /// Atomically apply `f` to the on-disk state under the exclusive
+    /// cross-process lock: load fresh → mutate → save, all while the lock is
+    /// held. This is the race-free read-modify-write primitive — every writer
+    /// should mutate through it (or, for async work, snapshot inputs before the
+    /// await and call `modify` afterward to re-apply only its owned fields), so
+    /// the monitor/compose/health/CLI cannot clobber each other.
+    ///
+    /// `f` MUST be synchronous and MUST NOT `.await` (holding an OS lock across
+    /// a task yield would serialize or deadlock the async runtime).
+    pub fn modify<R, E>(f: impl FnOnce(&mut StateFile) -> Result<R, E>) -> Result<R, E>
+    where
+        E: From<std::io::Error>,
+    {
+        let _lock = super::lock::StateLock::acquire()?;
+        let mut sf = Self::load_default()?;
+        let out = f(&mut sf)?;
+        sf.write_to_disk()?;
+        Ok(out)
+    }
+
+    /// Append a record atomically under the state lock (load fresh → push →
+    /// save). Use this instead of `load_default()? + add()` so concurrent
+    /// appends/removals cannot lose records.
+    pub fn add_record(record: BoxRecord) -> Result<(), std::io::Error> {
+        Self::modify(|sf| {
+            sf.records.push(record);
+            Ok::<(), std::io::Error>(())
+        })
+    }
+
+    /// Remove a record by id atomically under the state lock. Returns whether a
+    /// record was removed.
+    pub fn remove_record(id: &str) -> Result<bool, std::io::Error> {
+        Self::modify(|sf| {
+            let before = sf.records.len();
+            sf.records.retain(|r| r.id != id);
+            Ok::<bool, std::io::Error>(sf.records.len() < before)
+        })
+    }
+
     /// Add a record and persist.
     pub fn add(&mut self, record: BoxRecord) -> Result<(), std::io::Error> {
         self.records.push(record);
         self.save()
+    }
+
+    /// Drop a record from this in-memory handle WITHOUT persisting.
+    ///
+    /// Used by callers that already removed the record from disk atomically via
+    /// [`remove_record`](Self::remove_record); this keeps their in-memory view
+    /// consistent without a second `save` that would clobber concurrent writers.
+    pub(crate) fn forget(&mut self, id: &str) {
+        self.records.retain(|r| r.id != id);
     }
 
     /// Remove a record by ID and persist.
@@ -108,39 +165,59 @@ impl StateFile {
         &self.records
     }
 
-    /// Reconcile: check PID liveness for running boxes, mark dead ones.
+    /// Reconcile: check PID liveness for active boxes, mark dead ones.
     ///
     /// Returns a list of box IDs that should be restarted based on their
     /// restart policy. The caller is responsible for actually restarting them.
     fn reconcile(&mut self) -> Vec<String> {
         let mut changed = false;
         let mut restart_candidates = Vec::new();
+        let mut auto_remove_records = Vec::new();
+        let mut stopped_resource_records = Vec::new();
 
         for record in &mut self.records {
-            if record.status == "running" {
-                if let Some(pid) = record.pid {
-                    if !is_process_alive(pid) {
-                        record.status = "dead".to_string();
-                        record.pid = None;
-                        changed = true;
+            if !matches!(record.status.as_str(), "running" | "paused") {
+                continue;
+            }
 
-                        if should_restart(record) {
-                            restart_candidates.push(record.id.clone());
-                        }
-                    }
-                } else {
-                    // Running but no PID — mark as dead
-                    record.status = "dead".to_string();
-                    changed = true;
+            let has_live_pid = record.pid.is_some_and(is_process_alive);
+            if !has_live_pid {
+                record.status = "dead".to_string();
+                record.pid = None;
+                record.health_status = "none".to_string();
+                record.health_retries = 0;
+                changed = true;
 
-                    if should_restart(record) {
-                        restart_candidates.push(record.id.clone());
-                    }
+                if record.auto_remove {
+                    auto_remove_records.push(record.clone());
+                    continue;
+                }
+
+                stopped_resource_records.push(record.clone());
+
+                if should_restart(record) {
+                    restart_candidates.push(record.id.clone());
                 }
             }
         }
+
+        for record in &stopped_resource_records {
+            crate::cleanup::cleanup_stopped_box(record);
+        }
+
+        if !auto_remove_records.is_empty() {
+            for record in &auto_remove_records {
+                crate::cleanup::cleanup_removed_box(record);
+            }
+            self.records
+                .retain(|record| !auto_remove_records.iter().any(|r| r.id == record.id));
+            changed = true;
+        }
+
         if changed {
-            let _ = self.save();
+            // reconcile runs inside `load`, which `modify` calls while holding
+            // the state lock; use the unlocked write to avoid re-locking.
+            let _ = self.write_to_disk();
         }
 
         restart_candidates
@@ -163,41 +240,5 @@ impl StateFile {
             .iter()
             .filter(|r| r.labels.get(key).is_some_and(|v| v == value))
             .collect()
-    }
-
-    /// Mark a box as stopped and persist.
-    pub fn mark_stopped(&mut self, id: &str, exit_code: Option<i32>) {
-        if let Some(record) = self.find_by_id_mut(id) {
-            record.status = "stopped".to_string();
-            record.pid = None;
-            record.exit_code = exit_code;
-            let _ = self.save();
-        }
-    }
-
-    /// Increment restart count for a box and persist.
-    pub fn increment_restart_count(&mut self, id: &str) {
-        if let Some(record) = self.find_by_id_mut(id) {
-            record.restart_count += 1;
-            let _ = self.save();
-        }
-    }
-
-    /// Mark a box as started with a new PID and persist.
-    pub fn mark_started(&mut self, id: &str, pid: u32) {
-        if let Some(record) = self.find_by_id_mut(id) {
-            record.status = "running".to_string();
-            record.pid = Some(pid);
-            record.started_at = Some(chrono::Utc::now());
-            let _ = self.save();
-        }
-    }
-
-    /// Mark a box as stopped by user (for "unless-stopped" policy).
-    pub fn mark_stopped_by_user(&mut self, id: &str) {
-        if let Some(record) = self.find_by_id_mut(id) {
-            record.stopped_by_user = true;
-            let _ = self.save();
-        }
     }
 }

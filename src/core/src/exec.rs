@@ -36,10 +36,16 @@ pub struct ExecRequest {
     /// Working directory for the command.
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Optional guest-visible rootfs path to chroot into before executing.
+    #[serde(default)]
+    pub rootfs: Option<String>,
     /// Optional stdin data to pipe to the command.
     #[serde(default)]
     pub stdin: Option<Vec<u8>>,
-    /// User to run the command as (e.g., "root", "1000", "1000:1000").
+    /// Keep stdin open for subsequent streaming data frames.
+    #[serde(default)]
+    pub stdin_streaming: bool,
+    /// User to run the command as (supported: "root", "1000", "1000:1000").
     #[serde(default)]
     pub user: Option<String>,
     /// Enable streaming mode (receive output chunks as they arrive).
@@ -163,7 +169,9 @@ mod tests {
             timeout_ns: 3_000_000_000,
             env: vec!["FOO=bar".to_string()],
             working_dir: Some("/tmp".to_string()),
+            rootfs: Some("/run/a3s/cri/rootfs/sb/c/rootfs".to_string()),
             stdin: None,
+            stdin_streaming: false,
             user: None,
             streaming: false,
         };
@@ -173,7 +181,12 @@ mod tests {
         assert_eq!(parsed.timeout_ns, 3_000_000_000);
         assert_eq!(parsed.env, vec!["FOO=bar"]);
         assert_eq!(parsed.working_dir, Some("/tmp".to_string()));
+        assert_eq!(
+            parsed.rootfs,
+            Some("/run/a3s/cri/rootfs/sb/c/rootfs".to_string())
+        );
         assert!(parsed.stdin.is_none());
+        assert!(!parsed.stdin_streaming);
         assert!(parsed.user.is_none());
         assert!(!parsed.streaming);
     }
@@ -185,13 +198,34 @@ mod tests {
             timeout_ns: 0,
             env: vec![],
             working_dir: None,
+            rootfs: None,
             stdin: None,
+            stdin_streaming: false,
             user: None,
             streaming: true,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ExecRequest = serde_json::from_str(&json).unwrap();
         assert!(parsed.streaming);
+        assert!(!parsed.stdin_streaming);
+    }
+
+    #[test]
+    fn test_exec_request_stdin_streaming_flag() {
+        let req = ExecRequest {
+            cmd: vec!["cat".to_string()],
+            timeout_ns: 0,
+            env: vec![],
+            working_dir: None,
+            rootfs: None,
+            stdin: None,
+            stdin_streaming: true,
+            user: None,
+            streaming: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ExecRequest = serde_json::from_str(&json).unwrap();
+        assert!(parsed.stdin_streaming);
     }
 
     #[test]
@@ -238,7 +272,9 @@ mod tests {
             timeout_ns: 0,
             env: vec![],
             working_dir: None,
+            rootfs: None,
             stdin: None,
+            stdin_streaming: false,
             user: None,
             streaming: false,
         };
@@ -248,18 +284,22 @@ mod tests {
         assert_eq!(parsed.timeout_ns, 0);
         assert!(parsed.env.is_empty());
         assert!(parsed.working_dir.is_none());
+        assert!(parsed.rootfs.is_none());
+        assert!(!parsed.stdin_streaming);
         assert!(parsed.user.is_none());
     }
 
     #[test]
     fn test_exec_request_backward_compatible_deserialization() {
-        // Old format without streaming field should still parse (defaults to false)
+        // Old format without rootfs or streaming fields should still parse.
         let json = r#"{"cmd":["ls"],"timeout_ns":0}"#;
         let parsed: ExecRequest = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.cmd, vec!["ls"]);
         assert!(parsed.env.is_empty());
         assert!(parsed.working_dir.is_none());
+        assert!(parsed.rootfs.is_none());
         assert!(parsed.stdin.is_none());
+        assert!(!parsed.stdin_streaming);
         assert!(parsed.user.is_none());
         assert!(!parsed.streaming);
     }
@@ -271,13 +311,16 @@ mod tests {
             timeout_ns: 0,
             env: vec![],
             working_dir: None,
+            rootfs: None,
             stdin: Some(b"echo hello\n".to_vec()),
+            stdin_streaming: false,
             user: None,
             streaming: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ExecRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.stdin, Some(b"echo hello\n".to_vec()));
+        assert!(!parsed.stdin_streaming);
     }
 
     #[test]
@@ -287,7 +330,9 @@ mod tests {
             timeout_ns: 0,
             env: vec![],
             working_dir: None,
+            rootfs: None,
             stdin: None,
+            stdin_streaming: false,
             user: Some("root".to_string()),
             streaming: false,
         };
@@ -303,7 +348,9 @@ mod tests {
             timeout_ns: 0,
             env: vec![],
             working_dir: None,
+            rootfs: None,
             stdin: None,
+            stdin_streaming: false,
             user: Some("1000:1000".to_string()),
             streaming: false,
         };

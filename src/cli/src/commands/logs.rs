@@ -1,6 +1,7 @@
 //! `a3s-box logs` command — View box console logs.
 
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use clap::Args;
@@ -8,7 +9,7 @@ use clap::Args;
 use a3s_box_core::log::{LogDriver, LogEntry};
 
 use crate::resolve;
-use crate::state::StateFile;
+use crate::state::{BoxRecord, StateFile};
 
 #[derive(Args)]
 pub struct LogsArgs {
@@ -19,9 +20,9 @@ pub struct LogsArgs {
     #[arg(short, long)]
     pub follow: bool,
 
-    /// Number of lines to show from the end, or "all"
+    /// Number of lines to show from the end
     #[arg(long)]
-    pub tail: Option<String>,
+    pub tail: Option<usize>,
 
     /// Show logs since timestamp (e.g., "2024-01-01T00:00:00Z", "1h", "30m")
     #[arg(long)]
@@ -34,6 +35,12 @@ pub struct LogsArgs {
     /// Show timestamps on each line
     #[arg(short = 't', long)]
     pub timestamps: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogSource {
+    path: PathBuf,
+    structured: bool,
 }
 
 pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -49,28 +56,34 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Prefer structured JSON log (container.json) when available
-    let log_dir = record.box_dir.join("logs");
-    let json_log = a3s_box_runtime::log::json_log_path(&log_dir);
-    let use_json = json_log.exists();
-
-    let log_path = if use_json {
-        &json_log
-    } else {
-        &record.console_log
-    };
-    if !log_path.exists() {
-        return Err(format!("No logs found for box {}", record.name).into());
-    }
-
     let since = args.since.as_deref().map(parse_time_filter).transpose()?;
     let until = args.until.as_deref().map(parse_time_filter).transpose()?;
-    let tail = args.tail.as_deref().map(parse_tail).transpose()?;
 
+    let Some(log_source) = resolve_log_source(record) else {
+        if args.follow && record.status == "running" {
+            match wait_for_log_source(&record.id).await? {
+                Some(source) => return stream_logs(source, args, since, until).await,
+                None => return Ok(()),
+            }
+        }
+        return Ok(());
+    };
+
+    stream_logs(log_source, args, since, until).await
+}
+
+async fn stream_logs(
+    log_source: LogSource,
+    args: LogsArgs,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let use_json = log_source.structured;
+    let log_path = log_source.path;
     let has_time_filter = since.is_some() || until.is_some();
 
-    if let Some(TailMode::Lines(tail_n)) = tail {
-        let file = std::fs::File::open(log_path)?;
+    if let Some(tail_n) = args.tail {
+        let file = std::fs::File::open(&log_path)?;
         let reader = BufReader::new(file);
         let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
         let start = lines.len().saturating_sub(tail_n);
@@ -90,8 +103,8 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
                 print_line(line, args.timestamps);
             }
         }
-    } else if tail == Some(TailMode::All) || !args.follow {
-        let file = std::fs::File::open(log_path)?;
+    } else if !args.follow {
+        let file = std::fs::File::open(&log_path)?;
         let reader = BufReader::new(file);
         for line in reader.lines() {
             let line = line?;
@@ -113,9 +126,8 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.follow {
-        let file = std::fs::File::open(log_path)?;
+        let file = std::fs::File::open(&log_path)?;
         let mut reader = BufReader::new(file);
-
         reader.seek(SeekFrom::End(0))?;
 
         loop {
@@ -140,7 +152,11 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
                         {
                             continue;
                         }
-                        print_line(trimmed, args.timestamps);
+                        if args.timestamps {
+                            print!("{} {}", Utc::now().to_rfc3339(), line);
+                        } else {
+                            print!("{line}");
+                        }
                     }
                 }
                 Err(e) => {
@@ -153,21 +169,43 @@ pub async fn execute(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TailMode {
-    All,
-    Lines(usize),
-}
-
-fn parse_tail(value: &str) -> Result<TailMode, String> {
-    if value == "all" {
-        return Ok(TailMode::All);
+fn resolve_log_source(record: &BoxRecord) -> Option<LogSource> {
+    let log_dir = record.box_dir.join("logs");
+    let json_log = a3s_box_runtime::log::json_log_path(&log_dir);
+    if json_log.exists() {
+        return Some(LogSource {
+            path: json_log,
+            structured: true,
+        });
     }
 
-    let lines = value.parse::<usize>().map_err(|_| {
-        format!("Invalid --tail value {value:?}: expected non-negative integer or 'all'")
-    })?;
-    Ok(TailMode::Lines(lines))
+    if record.console_log.exists() {
+        return Some(LogSource {
+            path: record.console_log.clone(),
+            structured: false,
+        });
+    }
+
+    None
+}
+
+async fn wait_for_log_source(
+    box_id: &str,
+) -> Result<Option<LogSource>, Box<dyn std::error::Error>> {
+    loop {
+        let state = StateFile::load_default()?;
+        let Some(record) = state.find_by_id(box_id) else {
+            return Ok(None);
+        };
+        if let Some(source) = resolve_log_source(record) {
+            return Ok(Some(source));
+        }
+        if record.status != "running" || record.log_config.driver == LogDriver::None {
+            return Ok(None);
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
 }
 
 /// Print a structured JSON log line, extracting the message and optional timestamp.
@@ -325,27 +363,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_tail_all() {
-        assert_eq!(parse_tail("all").unwrap(), TailMode::All);
-    }
-
-    #[test]
-    fn test_parse_tail_lines() {
-        assert_eq!(parse_tail("25").unwrap(), TailMode::Lines(25));
-    }
-
-    #[test]
-    fn test_parse_tail_zero() {
-        assert_eq!(parse_tail("0").unwrap(), TailMode::Lines(0));
-    }
-
-    #[test]
-    fn test_parse_tail_invalid() {
-        assert!(parse_tail("latest").is_err());
-        assert!(parse_tail("-1").is_err());
-    }
-
-    #[test]
     fn test_parse_duration_seconds() {
         let d = parse_duration("30s").unwrap();
         assert_eq!(d.num_seconds(), 30);
@@ -426,5 +443,50 @@ mod tests {
     fn test_extract_line_timestamp_none() {
         let ts = extract_line_timestamp("just a regular log line");
         assert!(ts.is_none());
+    }
+
+    #[test]
+    fn test_resolve_log_source_prefers_structured_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("log-id", "logs", "stopped", None);
+        record.box_dir = tmp.path().join("box");
+        let log_dir = record.box_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        record.console_log = log_dir.join("console.log");
+        std::fs::write(&record.console_log, "console\n").unwrap();
+        let json_log = a3s_box_runtime::log::json_log_path(&log_dir);
+        std::fs::write(&json_log, "{}\n").unwrap();
+
+        let source = resolve_log_source(&record).unwrap();
+        assert!(source.structured);
+        assert_eq!(source.path, json_log);
+    }
+
+    #[test]
+    fn test_resolve_log_source_falls_back_to_console_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("log-id", "logs", "stopped", None);
+        record.box_dir = tmp.path().join("box");
+        let log_dir = record.box_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        record.console_log = log_dir.join("console.log");
+        std::fs::write(&record.console_log, "console\n").unwrap();
+
+        let source = resolve_log_source(&record).unwrap();
+        assert!(!source.structured);
+        assert_eq!(source.path, record.console_log);
+    }
+
+    #[test]
+    fn test_resolve_log_source_missing_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut record =
+            crate::test_helpers::fixtures::make_record("log-id", "logs", "stopped", None);
+        record.box_dir = tmp.path().join("box");
+        record.console_log = record.box_dir.join("logs").join("console.log");
+
+        assert!(resolve_log_source(&record).is_none());
     }
 }

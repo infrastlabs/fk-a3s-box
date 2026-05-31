@@ -236,7 +236,12 @@ fn find_system_libkrun() -> Result<PathBuf, String> {
         .atleast_version("1.0")
         .probe("libkrun")
     {
-        if let Some(path) = lib.link_paths.first() {
+        // Some distributions (notably Homebrew's `libkrun-efi` formula on
+        // macOS) ship a misleading `libkrun.pc` whose libdir points at a
+        // directory that only contains `libkrun-efi.dylib`, not the bare
+        // `libkrun.dylib` the linker looks for via `-lkrun`. Validate the
+        // path before trusting it; otherwise fall through to common paths.
+        if let Some(path) = lib.link_paths.iter().find(|p| has_exact_library(p, "krun")) {
             return Ok(path.clone());
         }
     }
@@ -248,12 +253,46 @@ fn find_system_libkrun() -> Result<PathBuf, String> {
 
     for path in common_paths {
         let lib_path = Path::new(path);
-        if has_library(lib_path, "libkrun") {
+        if has_exact_library(lib_path, "krun") {
             return Ok(lib_path.to_path_buf());
         }
     }
 
     Err("libkrun not found in system paths".to_string())
+}
+
+/// Checks if `dir` contains a library named exactly `lib<name>.<ext>`.
+/// This is stricter than `has_library`: it prevents matching sibling
+/// libraries like `libkrun-efi.dylib` when looking for `libkrun.dylib`.
+/// Both unversioned (`libkrun.dylib`) and versioned (`libkrun.so.1`)
+/// library names are accepted.
+fn has_exact_library(dir: &Path, name: &str) -> bool {
+    let extensions: &[&str] = if cfg!(target_os = "macos") {
+        &["dylib"]
+    } else if cfg!(target_os = "linux") {
+        &["so"]
+    } else {
+        &["dll"]
+    };
+
+    let prefix = format!("lib{name}");
+    dir.read_dir()
+        .ok()
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let filename = entry.file_name();
+                let filename_str = filename.to_string_lossy();
+                let Some(rest) = filename_str.strip_prefix(&prefix) else {
+                    return false;
+                };
+                // Accept if rest equals extension (unversioned) or starts with
+                // '.' and ends with extension (versioned, e.g. libkrun.so.1)
+                extensions
+                    .iter()
+                    .any(|ext| rest == *ext || (rest.starts_with('.') && rest.ends_with(ext)))
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Returns libkrun build environment with features enabled.
@@ -749,14 +788,8 @@ fn download_libkrunfw_so(install_dir: &Path) {
     let tarball_path = install_dir.join("libkrunfw.tgz");
 
     if !tarball_path.exists() {
-        if let Ok(local) = env::var("LIBKRUNFW_LOCAL_PATH") {
-            println!("cargo:warning=Using local libkrunfw from {}", local);
-            std::fs::copy(&local, &tarball_path)
-                .unwrap_or_else(|e| panic!("Failed to copy local libkrunfw from {}: {}", local, e));
-        } else {
-            download_file(LIBKRUNFW_SO_URL, &tarball_path)
-                .unwrap_or_else(|e| panic!("Failed to download libkrunfw: {}", e));
-        }
+        download_file(LIBKRUNFW_SO_URL, &tarball_path)
+            .unwrap_or_else(|e| panic!("Failed to download libkrunfw: {}", e));
 
         verify_sha256(&tarball_path, LIBKRUNFW_SHA256)
             .unwrap_or_else(|e| panic!("Failed to verify libkrunfw checksum: {}", e));

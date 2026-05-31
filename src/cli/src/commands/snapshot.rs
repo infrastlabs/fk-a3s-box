@@ -118,8 +118,16 @@ async fn execute_create(args: SnapshotCreateArgs) -> Result<(), Box<dyn std::err
         meta.description = desc.clone();
     }
 
-    // Snapshot the rootfs
-    let rootfs_path = record.box_dir.join("rootfs");
+    // Snapshot the box's current root filesystem (overlay `merged` or the plain
+    // provider's `rootfs`), so runtime changes are captured — not an empty dir.
+    let rootfs_path = super::resolve_box_rootfs(&record.box_dir).ok_or_else(|| {
+        format!(
+            "Rootfs not found for box '{}' under {} (looked for merged/ and rootfs/); \
+             snapshot a running box",
+            record.name,
+            record.box_dir.display()
+        )
+    })?;
     let store = SnapshotStore::default_path()?;
     let saved = store.save(meta, &rootfs_path)?;
 
@@ -155,6 +163,9 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
     let box_rootfs = box_dir.join("rootfs");
     if snap_rootfs.exists() {
         copy_dir_recursive_io(&snap_rootfs, &box_rootfs)?;
+        // Mark the box so the runtime boots directly from this restored rootfs
+        // instead of rebuilding from the image (preserves the snapshot's fs).
+        std::fs::write(box_dir.join(".snapshot-rootfs"), b"")?;
     }
 
     let record = BoxRecord {
@@ -187,6 +198,7 @@ async fn execute_restore(args: SnapshotRestoreArgs) -> Result<(), Box<dyn std::e
         max_restart_count: 0,
         exit_code: None,
         health_check: None,
+        healthcheck_disabled: false,
         health_status: "none".to_string(),
         health_retries: 0,
         health_last_check: None,

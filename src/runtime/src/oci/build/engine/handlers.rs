@@ -11,6 +11,9 @@ use super::utils::{
 };
 use super::BuildState;
 
+#[cfg(target_os = "macos")]
+const UNSAFE_HOST_RUN_ENV: &str = "A3S_BOX_UNSAFE_HOST_RUN";
+
 /// Handle COPY: copy files from build context into rootfs, create a layer.
 pub(super) fn handle_copy(
     src_patterns: &[String],
@@ -98,15 +101,14 @@ pub(super) fn handle_copy(
 
 /// Handle RUN: execute a command in the rootfs.
 ///
-/// On Linux, uses chroot. On macOS, host execution is disabled unless explicitly
-/// opted in for development because it cannot match Linux container semantics.
+/// On Linux, uses chroot. On macOS, isolated RUN execution is not implemented yet.
 /// Returns Some(LayerInfo) if a layer was created, None if skipped.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_run(
     command: &str,
     rootfs_dir: &Path,
     layers_dir: &Path,
-    #[allow(unused_variables)] workdir: &str,
+    workdir: &str,
     env: &[(String, String)],
     shell: &[String],
     layer_index: usize,
@@ -114,8 +116,15 @@ pub(super) fn handle_run(
 ) -> Result<Option<LayerInfo>> {
     #[cfg(target_os = "macos")]
     {
-        // On macOS, use a3s-box MicroVM to execute RUN commands
-        handle_run_via_microvm(
+        if !unsafe_host_run_enabled() {
+            return Err(BoxError::BuildError(format!(
+                "Dockerfile RUN is not supported on macOS yet because isolated Linux build \
+                 execution is not implemented. Re-run on Linux or set {UNSAFE_HOST_RUN_ENV}=1 \
+                 to opt into unsafe host-side execution for local experiments."
+            )));
+        }
+
+        handle_run_on_host_unsafe(
             command,
             rootfs_dir,
             layers_dir,
@@ -131,6 +140,9 @@ pub(super) fn handle_run(
     #[cfg(target_os = "linux")]
     {
         use super::super::layer::DirSnapshot;
+
+        validate_linux_run_preconditions(rootfs_dir, shell, linux_effective_uid())?;
+        let workdir_path = ensure_linux_run_workdir(rootfs_dir, workdir)?;
 
         let before = DirSnapshot::capture(rootfs_dir)?;
 
@@ -149,6 +161,7 @@ pub(super) fn handle_run(
             cmd.arg("-c");
         }
         cmd.arg(command);
+        cmd.current_dir(&workdir_path);
 
         // Set environment
         cmd.env_clear();
@@ -198,7 +211,6 @@ pub(super) fn handle_run(
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (
-            command,
             rootfs_dir,
             layers_dir,
             workdir,
@@ -207,18 +219,93 @@ pub(super) fn handle_run(
             layer_index,
             quiet,
         );
-        Ok(None)
+        Err(BoxError::BuildError(format!(
+            "Dockerfile RUN is not supported on this platform yet because isolated Linux build execution is not implemented: {}",
+            command
+        )))
     }
 }
 
-/// Execute RUN command directly on host (macOS development fallback).
+#[cfg(any(target_os = "linux", test))]
+fn linux_run_shell_path(shell: &[String]) -> &str {
+    shell.first().map(String::as_str).unwrap_or("/bin/sh")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_linux_run_preconditions(
+    rootfs_dir: &Path,
+    shell: &[String],
+    effective_uid: u32,
+) -> Result<()> {
+    if effective_uid != 0 {
+        return Err(BoxError::BuildError(
+            "Dockerfile RUN on Linux requires root privileges because the current isolated build path uses chroot. Re-run as root or build on a root-capable builder.".to_string(),
+        ));
+    }
+
+    let shell_path = linux_run_shell_path(shell);
+    if !shell_path.starts_with('/') {
+        return Err(BoxError::BuildError(format!(
+            "Dockerfile RUN shell '{}' is not absolute; SHELL must name an absolute in-rootfs executable",
+            shell_path
+        )));
+    }
+    let shell_in_rootfs = rootfs_dir.join(shell_path.trim_start_matches('/'));
+    if !shell_in_rootfs.exists() {
+        return Err(BoxError::BuildError(format!(
+            "Dockerfile RUN shell '{}' was not found in rootfs at {}; the base image must contain the configured shell",
+            shell_path,
+            shell_in_rootfs.display()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn ensure_linux_run_workdir(rootfs_dir: &Path, workdir: &str) -> Result<PathBuf> {
+    let workdir = if workdir.trim().is_empty() {
+        "/"
+    } else {
+        workdir
+    };
+    if !workdir.starts_with('/') {
+        return Err(BoxError::BuildError(format!(
+            "Dockerfile RUN workdir '{}' is not absolute",
+            workdir
+        )));
+    }
+
+    let workdir_path = rootfs_dir.join(workdir.trim_start_matches('/'));
+    std::fs::create_dir_all(&workdir_path).map_err(|e| {
+        BoxError::BuildError(format!(
+            "Failed to create RUN workdir {}: {}",
+            workdir_path.display(),
+            e
+        ))
+    })?;
+    Ok(workdir_path)
+}
+
+#[cfg(target_os = "macos")]
+fn unsafe_host_run_enabled() -> bool {
+    std::env::var(UNSAFE_HOST_RUN_ENV)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+/// Execute RUN command directly on host (unsafe macOS escape hatch).
 ///
-/// This is intentionally opt-in. Running Dockerfile `RUN` instructions on the
-/// Darwin host can produce layers that do not behave like Linux container
-/// layers, so normal builds fail clearly until the MicroVM build executor lands.
+/// This does not provide container/Linux build semantics. It exists only for
+/// explicit local experiments while isolated macOS build execution is pending.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-fn handle_run_via_microvm(
+fn handle_run_on_host_unsafe(
     command: &str,
     rootfs_dir: &Path,
     layers_dir: &Path,
@@ -230,15 +317,8 @@ fn handle_run_via_microvm(
 ) -> Result<Option<LayerInfo>> {
     use super::super::layer::DirSnapshot;
 
-    if std::env::var("A3S_BOX_ALLOW_HOST_RUN").as_deref() != Ok("1") {
-        return Err(BoxError::BuildError(
-            "Dockerfile RUN is not supported on macOS yet because the MicroVM build executor is not implemented. Set A3S_BOX_ALLOW_HOST_RUN=1 to use the unsafe host-execution fallback for development."
-                .to_string(),
-        ));
-    }
-
     if !quiet {
-        println!("→ Executing RUN command on host (A3S_BOX_ALLOW_HOST_RUN=1)");
+        println!("→ Executing RUN command on host (unsafe)");
     }
 
     // Capture filesystem state before execution
@@ -324,13 +404,20 @@ fn handle_run_via_microvm(
 pub(super) fn handle_add(
     src_patterns: &[String],
     dst: &str,
-    _chown: Option<&str>,
+    chown: Option<&str>,
     context_dir: &Path,
     rootfs_dir: &Path,
     layers_dir: &Path,
     workdir: &str,
     layer_index: usize,
 ) -> Result<LayerInfo> {
+    if let Some(chown) = chown {
+        return Err(BoxError::BuildError(format!(
+            "ADD --chown={} is not supported yet",
+            chown
+        )));
+    }
+
     let resolved_dst = resolve_path(workdir, dst);
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
 
@@ -467,10 +554,10 @@ pub(super) fn execute_onbuild_trigger(
             state.user = Some(user.clone());
         }
         _ => {
-            tracing::warn!(
-                trigger = trigger,
-                "ONBUILD trigger requires execution context, skipping"
-            );
+            return Err(BoxError::BuildError(format!(
+                "ONBUILD trigger '{}' is not supported yet because it requires build execution context",
+                trigger
+            )));
         }
     }
 
@@ -574,8 +661,8 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             let client = reqwest::Client::builder()
-                .no_proxy()
                 .timeout(std::time::Duration::from_secs(60))
+                .no_proxy()
                 .build()
                 .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
@@ -601,7 +688,10 @@ fn download_url(url: &str) -> std::result::Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::super::super::dockerfile::Instruction;
-    use super::instruction_to_string;
+    use super::{execute_onbuild_trigger, handle_add, instruction_to_string};
+    use crate::oci::build::engine::{BuildConfig, BuildState};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     #[test]
     fn test_instruction_to_string_run() {
@@ -830,5 +920,149 @@ mod tests {
             instruction: Box::new(inner),
         };
         assert_eq!(instruction_to_string(&instr), "ONBUILD RUN echo triggered");
+    }
+
+    #[test]
+    fn test_handle_add_rejects_chown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let layers = tmp.path().join("layers");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&layers).unwrap();
+
+        let err = handle_add(
+            &["file.txt".to_string()],
+            "/tmp/file.txt",
+            Some("1000:1000"),
+            tmp.path(),
+            &rootfs,
+            &layers,
+            "/",
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("ADD --chown=1000:1000 is not supported yet"));
+    }
+
+    #[test]
+    fn test_execute_onbuild_trigger_rejects_execution_instruction() {
+        let mut state = BuildState::new(HashMap::new());
+        let config = BuildConfig {
+            context_dir: PathBuf::from("/tmp/context"),
+            dockerfile_path: PathBuf::from("/tmp/context/Dockerfile"),
+            tag: None,
+            build_args: HashMap::new(),
+            quiet: true,
+            platforms: vec![],
+            metrics: None,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let err = execute_onbuild_trigger(
+            "RUN echo trigger",
+            &mut state,
+            &config,
+            tmp.path(),
+            tmp.path(),
+            &[],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("ONBUILD trigger 'RUN echo trigger' is not supported yet"));
+    }
+
+    #[test]
+    fn test_linux_run_shell_path_defaults_to_bin_sh() {
+        assert_eq!(super::linux_run_shell_path(&[]), "/bin/sh");
+        assert_eq!(
+            super::linux_run_shell_path(&["/bin/bash".to_string(), "-c".to_string()]),
+            "/bin/bash"
+        );
+    }
+
+    #[test]
+    fn test_linux_run_preconditions_reject_non_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+        std::fs::write(rootfs.join("bin/sh"), "fake shell").unwrap();
+
+        let err = super::validate_linux_run_preconditions(&rootfs, &[], 1000)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("requires root privileges"));
+    }
+
+    #[test]
+    fn test_linux_run_preconditions_reject_missing_shell() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let err = super::validate_linux_run_preconditions(&rootfs, &[], 0)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("was not found in rootfs"));
+    }
+
+    #[test]
+    fn test_linux_run_preconditions_reject_relative_shell() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let err = super::validate_linux_run_preconditions(&rootfs, &["sh".to_string()], 0)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("is not absolute"));
+    }
+
+    #[test]
+    fn test_ensure_linux_run_workdir_creates_absolute_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let workdir = super::ensure_linux_run_workdir(&rootfs, "/app/build").unwrap();
+
+        assert_eq!(workdir, rootfs.join("app/build"));
+        assert!(workdir.is_dir());
+    }
+
+    #[test]
+    fn test_ensure_linux_run_workdir_rejects_relative_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let err = super::ensure_linux_run_workdir(&rootfs, "app")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("is not absolute"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_handle_run_rejects_macos_without_unsafe_opt_in() {
+        std::env::remove_var(super::UNSAFE_HOST_RUN_ENV);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        let layers = tmp.path().join("layers");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&layers).unwrap();
+
+        let result = super::handle_run("echo unsafe", &rootfs, &layers, "/", &[], &[], 0, true);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Dockerfile RUN is not supported on macOS yet"));
+        assert!(err.contains(super::UNSAFE_HOST_RUN_ENV));
     }
 }

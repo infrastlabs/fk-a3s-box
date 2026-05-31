@@ -16,6 +16,9 @@
 
 use std::os::raw::c_char;
 
+#[cfg(test)]
+mod find_lib;
+
 // Log constants from libkrun.h
 pub const KRUN_LOG_TARGET_DEFAULT: i32 = -1;
 pub const KRUN_LOG_TARGET_STDOUT: i32 = 1;
