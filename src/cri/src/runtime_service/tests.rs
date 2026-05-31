@@ -31,6 +31,7 @@ fn make_test_service() -> BoxRuntimeService {
         attach_streams: Arc::new(RwLock::new(HashMap::new())),
         workload_stdins: Arc::new(RwLock::new(HashMap::new())),
         workload_stops: Arc::new(RwLock::new(HashMap::new())),
+        log_reopens: Arc::new(RwLock::new(HashMap::new())),
         container_events: broadcast::channel(CONTAINER_EVENT_BUFFER).0,
         warm_pool: None,
         runtime_options: CriRuntimeOptions::default(),
@@ -3187,16 +3188,18 @@ async fn test_reopen_container_log_empty_path() {
 }
 
 #[tokio::test]
-async fn test_reopen_container_log_truncates_file() {
+async fn test_reopen_container_log_signals_supervisor() {
     let svc = make_test_service();
+    svc.store.containers.add(test_container("c-1", "sb-1")).await;
 
-    let dir = tempfile::tempdir().unwrap();
-    let log_path = dir.path().join("container.log");
-    std::fs::write(&log_path, "some log content here").unwrap();
-
-    let mut c = test_container("c-1", "sb-1");
-    c.log_path = log_path.to_string_lossy().to_string();
-    svc.store.containers.add(c).await;
+    // Register a reopen signal as StartContainer does for a running container.
+    // The actual file reopen happens in the exit supervisor (integration-tested
+    // via critest); here we verify the RPC fires the per-container signal.
+    let signal = std::sync::Arc::new(tokio::sync::Notify::new());
+    svc.log_reopens
+        .write()
+        .await
+        .insert("c-1".to_string(), signal.clone());
 
     svc.reopen_container_log(Request::new(ReopenContainerLogRequest {
         container_id: "c-1".to_string(),
@@ -3204,9 +3207,10 @@ async fn test_reopen_container_log_truncates_file() {
     .await
     .unwrap();
 
-    // File should be truncated
-    let content = std::fs::read_to_string(&log_path).unwrap();
-    assert!(content.is_empty());
+    // notify_one() stores a permit, so notified() resolves immediately.
+    tokio::time::timeout(std::time::Duration::from_secs(1), signal.notified())
+        .await
+        .expect("ReopenContainerLog should signal the container's reopen notify");
 }
 
 // ── Stop/Remove Pod Sandbox (store-only, no VM) ──────────────────
