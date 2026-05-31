@@ -357,7 +357,14 @@ fn build_command(
     };
     let timeout = Duration::from_nanos(timeout_ns);
     let workdir = spec.working_dir.unwrap_or("/");
-    let process_user = match parse_process_user(spec.user) {
+    // Resolve a named user (CRI RunAsUserName) against the container's
+    // /etc/passwd before numeric parsing; falls through to spec.user when the
+    // value is already numeric/root or cannot be resolved.
+    let resolved_user = spec
+        .user
+        .zip(spec.rootfs)
+        .and_then(|(user, rootfs)| crate::user::resolve_named_user(user, rootfs));
+    let process_user = match parse_process_user(resolved_user.as_deref().or(spec.user)) {
         Ok(process_user) => process_user,
         Err(error) => {
             return Err(ExecOutput {

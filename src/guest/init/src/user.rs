@@ -39,6 +39,38 @@ pub fn parse_process_user(user: Option<&str>) -> Result<Option<ProcessUser>, Str
     Ok(Some(ProcessUser { uid, gid }))
 }
 
+/// Resolve a named user (e.g. CRI `RunAsUserName` "nobody") to a numeric
+/// `"uid:gid"` string by looking it up in the container's `<rootfs>/etc/passwd`.
+///
+/// Returns `None` when no resolution is needed or possible — the user is
+/// numeric / `root` (handled by [`parse_process_user`]), the passwd file is
+/// missing, or the name is not found — leaving `parse_process_user` to accept
+/// the numeric form or reject the unresolved name. An explicit numeric group
+/// suffix (`name:gid`) is preserved.
+pub fn resolve_named_user(user: &str, rootfs: &str) -> Option<String> {
+    let user = user.trim();
+    let (name, group_suffix) = match user.split_once(':') {
+        Some((name, group)) => (name, Some(group)),
+        None => (user, None),
+    };
+    if name.is_empty() || name == "root" || name.parse::<u32>().is_ok() {
+        return None;
+    }
+    let passwd = std::fs::read_to_string(std::path::Path::new(rootfs).join("etc/passwd")).ok()?;
+    for line in passwd.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 4 && fields[0] == name {
+            let uid: u32 = fields[2].parse().ok()?;
+            let gid: u32 = fields[3].parse().ok()?;
+            return Some(match group_suffix {
+                Some(group) => format!("{uid}:{group}"),
+                None => format!("{uid}:{gid}"),
+            });
+        }
+    }
+    None
+}
+
 fn parse_user_part(part: &str, label: &str, original: &str) -> Result<u32, String> {
     if part.is_empty() {
         return Err(format!(
