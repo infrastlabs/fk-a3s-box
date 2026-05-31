@@ -734,6 +734,22 @@ impl RuntimeService for BoxRuntimeService {
         } else {
             config.working_dir.clone()
         };
+        // CRI requires run_as_group to be set only alongside run_as_user or
+        // run_as_username; otherwise the runtime MUST reject the container.
+        if let Some(sc) = config
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.security_context.as_ref())
+        {
+            if sc.run_as_group.is_some()
+                && sc.run_as_user.is_none()
+                && sc.run_as_username.is_empty()
+            {
+                return Err(Status::invalid_argument(
+                    "run_as_group must not be set without run_as_user or run_as_username",
+                ));
+            }
+        }
         let user = container_user_from_linux_config(config.linux.as_ref())
             .or_else(|| image_config.and_then(|image| image.user.clone()));
         let (resolved_image_digest, resolved_image_path) = resolved_image
@@ -1615,7 +1631,9 @@ impl RuntimeService for BoxRuntimeService {
             },
             stdin: None,
             stdin_streaming: false,
-            user: None,
+            // ExecSync runs in the container, so it inherits the container's
+            // configured user (RunAsUser/RunAsGroup) — not root.
+            user: container.user.clone(),
             streaming: false,
         };
         let output = vm
