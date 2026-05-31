@@ -436,7 +436,25 @@ fn build_command(
         }
     }
 
-    configure_child_process(&mut command, spec.rootfs, workdir, process_user);
+    // CRI SupplementalGroups arrive as A3S_SEC_SUPPLEMENTAL_GROUPS=gid,gid,...
+    // and are applied (setgroups) before dropping to the target uid/gid.
+    let supplemental_groups: Vec<u32> = spec
+        .env
+        .iter()
+        .find_map(|entry| entry.strip_prefix("A3S_SEC_SUPPLEMENTAL_GROUPS="))
+        .map(|csv| {
+            csv.split(',')
+                .filter_map(|gid| gid.trim().parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    configure_child_process(
+        &mut command,
+        spec.rootfs,
+        workdir,
+        process_user,
+        supplemental_groups,
+    );
     if spec.rootfs.is_none() {
         if let Some(dir) = spec.working_dir {
             command.current_dir(dir);
@@ -799,6 +817,7 @@ fn configure_child_process(
     rootfs: Option<&str>,
     workdir: &str,
     user: Option<ProcessUser>,
+    supplemental_groups: Vec<u32>,
 ) {
     use std::ffi::CString;
     use std::os::unix::process::CommandExt;
@@ -820,6 +839,17 @@ fn configure_child_process(
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            // Apply supplemental groups while still privileged — setgroups
+            // needs CAP_SETGID, which user.apply() drops via setuid below.
+            if !supplemental_groups.is_empty() {
+                let ret = libc::setgroups(
+                    supplemental_groups.len() as libc::size_t,
+                    supplemental_groups.as_ptr() as *const libc::gid_t,
+                );
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             if let Some(user) = user {
                 user.apply()?;
             }
@@ -834,6 +864,7 @@ fn configure_child_process(
     _rootfs: Option<&str>,
     _workdir: &str,
     _user: Option<ProcessUser>,
+    _supplemental_groups: Vec<u32>,
 ) {
 }
 

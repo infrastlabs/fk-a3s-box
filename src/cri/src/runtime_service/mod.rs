@@ -726,7 +726,7 @@ impl RuntimeService for BoxRuntimeService {
         let image_env = image_config
             .map(|image| image.env.as_slice())
             .unwrap_or(&[]);
-        let env = merge_env(image_env, &config.envs);
+        let mut env = merge_env(image_env, &config.envs);
         let working_dir = if config.working_dir.is_empty() {
             image_config
                 .and_then(|image| image.working_dir.clone())
@@ -748,6 +748,17 @@ impl RuntimeService for BoxRuntimeService {
                 return Err(Status::invalid_argument(
                     "run_as_group must not be set without run_as_user or run_as_username",
                 ));
+            }
+            // Carry CRI SupplementalGroups to guest-init over the env channel;
+            // the guest applies them with setgroups before dropping privileges.
+            if !sc.supplemental_groups.is_empty() {
+                let groups = sc
+                    .supplemental_groups
+                    .iter()
+                    .map(|gid| gid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                env.push(("A3S_SEC_SUPPLEMENTAL_GROUPS".to_string(), groups));
             }
         }
         let user = container_user_from_linux_config(config.linux.as_ref())
@@ -1622,7 +1633,15 @@ impl RuntimeService for BoxRuntimeService {
         let exec_request = a3s_box_core::exec::ExecRequest {
             cmd: req.cmd,
             timeout_ns,
-            env: vec![],
+            // Inherit the container's security envelope (A3S_SEC_*, e.g.
+            // SupplementalGroups) so ExecSync probes (`id`) observe the same
+            // privileges the main process runs with.
+            env: container
+                .env
+                .iter()
+                .filter(|(key, _)| key.starts_with("A3S_SEC_"))
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect(),
             working_dir: None,
             rootfs: if container.rootfs_guest_path.is_empty() {
                 None
