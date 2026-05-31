@@ -252,14 +252,27 @@ impl ImageStore {
 
         let data = serde_json::to_string_pretty(&store_index)?;
         let index_path = self.store_dir.join("index.json");
-
-        tokio::fs::write(&index_path, data).await.map_err(|e| {
+        // Write atomically (tmp + rename) so a concurrent reader (e.g. another
+        // process running `create`/`run`) never observes a truncated/empty
+        // index.json mid-write — which previously surfaced as
+        // "Failed to parse image store index: EOF".
+        let tmp_path = self.store_dir.join("index.json.tmp");
+        tokio::fs::write(&tmp_path, data).await.map_err(|e| {
             BoxError::OciImageError(format!(
                 "Failed to write image store index {}: {}",
-                index_path.display(),
+                tmp_path.display(),
                 e
             ))
         })?;
+        tokio::fs::rename(&tmp_path, &index_path)
+            .await
+            .map_err(|e| {
+                BoxError::OciImageError(format!(
+                    "Failed to commit image store index {}: {}",
+                    index_path.display(),
+                    e
+                ))
+            })?;
 
         Ok(())
     }
