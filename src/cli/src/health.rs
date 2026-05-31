@@ -64,19 +64,23 @@ async fn run_health_loop(box_id: String, exec_socket_path: PathBuf, hc: HealthCh
 
         let healthy = run_probe(&exec_socket_path, &hc.cmd, timeout_ns).await;
 
-        let Ok(mut state) = StateFile::load_default() else {
-            continue;
-        };
-        let Some(record) = state.find_by_id_mut(&box_id) else {
-            break; // Box removed from state
-        };
-        if record.status != "running" {
-            break;
+        // Reload fresh under the state lock and apply ONLY this box's health
+        // fields, so concurrent monitor/CLI writers are not clobbered.
+        let keep_going = StateFile::modify(|state| {
+            let Some(record) = state.find_by_id_mut(&box_id) else {
+                return Ok::<bool, std::io::Error>(false); // box removed
+            };
+            if record.status != "running" {
+                return Ok(false); // box stopped
+            }
+            apply_probe_result(record, healthy, chrono::Utc::now());
+            Ok(true)
+        });
+        match keep_going {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(_) => continue,
         }
-
-        apply_probe_result(record, healthy, chrono::Utc::now());
-
-        let _ = state.save();
     }
 }
 
