@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <em>Run Linux OCI images inside libkrun MicroVMs, with a Docker-like CLI, local image store, volumes, TCP port publishing, opt-in TEE workflows, and an experimental Kubernetes CRI server.</em>
+  <em>Run Linux OCI images inside libkrun MicroVMs, with a Docker-like CLI, local image store, volumes, TCP port publishing, opt-in TEE workflows, and a Kubernetes CRI server reachable by crictl and the kubelet (core pod lifecycle and exec).</em>
 </p>
 
 ---
@@ -23,7 +23,7 @@ A3S Box is built toward production use, but it is not a full Docker, containerd,
 | Networking | Default TSI networking, TCP `host:guest` publishing, user-defined bridge networks, network inspect/connect/disconnect/rm, and `/etc/hosts` peer discovery are implemented with documented platform boundaries. |
 | Compose | A useful local subset is implemented: image, command, entrypoint, env, env_file, ports, volumes, depends_on, networks, DNS, tmpfs, workdir, hostname, extra_hosts, labels, healthcheck, restart, CPU/memory, capabilities, and privileged mode. |
 | TEE | AMD SEV-SNP-oriented attestation, RA-TLS, sealing, and secret injection flows exist, plus simulation mode for development. Hardware-backed operation depends on SEV-SNP-capable hosts and libkrun support. TDX is not a productized path. |
-| Kubernetes CRI | Experimental. RuntimeService/ImageService, streaming exec/attach/port-forward pieces, RuntimeClass image overrides, and crictl smoke harnesses exist. It is not the current core completion target and is not supported on Windows. |
+| Kubernetes CRI | Reachable by `crictl`/kubelet over its Unix socket. Verified on a `/dev/kvm` host: pod + container lifecycle (`RunPodSandbox` → `CreateContainer` → `StartContainer` → `Stop`/`Remove`), `exec` over Kubernetes SPDY/3.1 `remotecommand` (TTY and non-TTY, stdin/stdout/stderr, exit codes), and container log capture to `log_path`. Not yet conformant: `attach` and the stricter `critest` specs (log format, Linux SecurityContext, seccomp/AppArmor, namespaces, mount propagation). Linux-only; not the core completion target. |
 | Windows | Native WHPX backend through libkrun. The Windows package runs directly on Windows with Windows Hypervisor Platform enabled; it does not require WSL. Windows CRI is intentionally out of scope. |
 
 ## What A3S Box is
@@ -235,11 +235,19 @@ TEE features include SNP report parsing/verification, RA-TLS certificate extensi
 
 ## Kubernetes CRI
 
-The CRI server is experimental and not the current core completion target.
+The CRI server is reachable by standard gRPC clients — `crictl`, the kubelet, and `critest` — over its Unix domain socket, and runs the core pod + container lifecycle and `exec` end to end. It is Linux-only and not yet fully `critest`-conformant.
 
-Implemented pieces include CRI v1 RuntimeService/ImageService handlers, image service integration, pod sandbox lifecycle, one-container rootfs handoff, selected multi-container lifecycle coverage in unit tests, status verbose fields, streaming exec/attach/port-forward paths, RuntimeClass image overrides, and an ignored `crictl` smoke harness.
+Verified on a `/dev/kvm` host via `crictl`:
 
-Use it only for explicit evaluation:
+- CRI v1 RuntimeService/ImageService over the Unix socket. A vendored `h2` patch (`third_party/h2`, wired via `[patch.crates-io]`) relaxes the percent-encoded socket-path `:authority` that `grpc-go >= 1.57` sends, which upstream `h2` otherwise rejects with `PROTOCOL_ERROR` before any RPC runs.
+- Pod sandbox + container lifecycle: `runp` → `create` → `start` → `ps` → `stop` → `rm` → `stopp` → `rmp`.
+- `exec` over the Kubernetes SPDY/3.1 `remotecommand` protocol — `kubectl exec` / `crictl exec`, TTY and non-TTY, stdin/stdout/stderr, and exit-code propagation.
+- Container stdout/stderr captured to the CRI `log_path` and readable via `crictl logs`.
+- RuntimeClass image overrides.
+
+Not yet complete: `attach`, and the stricter `critest` conformance specs (log format, Linux SecurityContext, seccomp/AppArmor, namespace sharing, mount propagation). Track conformance in `docs/cri-conformance.md`.
+
+For an explicit cluster evaluation:
 
 ```bash
 helm install a3s-box deploy/helm/a3s-box/ -n a3s-box-system --create-namespace
