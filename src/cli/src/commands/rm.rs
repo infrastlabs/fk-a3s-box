@@ -63,8 +63,10 @@ fn rm_one(
     cleanup::cleanup_removed_box(&record);
 
     // Remove from state atomically under the lock (avoids clobbering concurrent
-    // monitor/CLI writers that rewrite the whole record vector).
+    // monitor/CLI writers that rewrite the whole record vector), then keep this
+    // in-memory handle consistent without a second persisting write.
     StateFile::remove_record(&box_id)?;
+    state.forget(&box_id);
     println!("{name}");
 
     Ok(())

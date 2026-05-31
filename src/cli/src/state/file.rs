@@ -104,6 +104,15 @@ impl StateFile {
         self.save()
     }
 
+    /// Drop a record from this in-memory handle WITHOUT persisting.
+    ///
+    /// Used by callers that already removed the record from disk atomically via
+    /// [`remove_record`](Self::remove_record); this keeps their in-memory view
+    /// consistent without a second `save` that would clobber concurrent writers.
+    pub(crate) fn forget(&mut self, id: &str) {
+        self.records.retain(|r| r.id != id);
+    }
+
     /// Remove a record by ID and persist.
     pub fn remove(&mut self, id: &str) -> Result<bool, std::io::Error> {
         let len_before = self.records.len();
