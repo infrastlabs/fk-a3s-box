@@ -768,6 +768,19 @@ impl RuntimeService for BoxRuntimeService {
             }
         }
 
+        // The CRI container `log_path` is relative to the sandbox's
+        // `log_directory`; store the combined path so the supervisor writes —
+        // and ContainerStatus reports — the file where the kubelet/critest look
+        // (`<log_directory>/<log_path>`).
+        let log_path = if config.log_path.is_empty() {
+            String::new()
+        } else {
+            std::path::Path::new(&sandbox.log_directory)
+                .join(&config.log_path)
+                .to_string_lossy()
+                .into_owned()
+        };
+
         let container = Container {
             id: container_id.clone(),
             sandbox_id: sandbox_id.to_string(),
@@ -791,7 +804,7 @@ impl RuntimeService for BoxRuntimeService {
             exit_code: 0,
             labels: config.labels.clone(),
             annotations: config.annotations.clone(),
-            log_path: config.log_path,
+            log_path,
             rootfs_path,
             rootfs_guest_path,
         };
@@ -846,8 +859,14 @@ impl RuntimeService for BoxRuntimeService {
 
         ensure_container_image_available(&container).await?;
 
+        // A container's main process runs until it exits or is stopped — it must
+        // NOT be killed by the one-shot exec timeout (`DEFAULT_EXEC_TIMEOUT_NS`).
+        // Using the default 5s timeout would kill every long-running container
+        // and inject "Process killed: timeout exceeded" into its stderr/logs and
+        // any `attach` stream. Run it effectively unbounded; `StopContainer`
+        // cancels it explicitly.
         let exec_request = container
-            .to_exec_request(a3s_box_core::exec::DEFAULT_EXEC_TIMEOUT_NS)
+            .to_exec_request(u64::MAX)
             .map_err(|e| Status::failed_precondition(format!("Invalid container command: {e}")))?;
 
         let (exec_socket_path, pty_socket_path) = {
