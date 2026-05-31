@@ -69,6 +69,10 @@ pub fn cleanup_external_socket_dir(box_dir: &Path, exec_socket_path: &Path) {
     let Some(socket_dir) = exec_socket_path.parent() else {
         return;
     };
+    // Reap the box's passt daemon (Linux bridge mode). passt outlives the
+    // process that launched it, so box teardown terminates it via its PID file.
+    #[cfg(target_os = "linux")]
+    a3s_box_runtime::network::terminate_passt(socket_dir);
     if socket_dir.starts_with(box_dir) {
         return;
     }
