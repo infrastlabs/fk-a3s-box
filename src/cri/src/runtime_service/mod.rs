@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::{future::join_all, Stream};
-use tokio::sync::{broadcast, oneshot, RwLock};
+use tokio::sync::{broadcast, oneshot, Notify, RwLock};
 use tonic::{Request, Response, Status};
 
 use a3s_box_core::event::EventEmitter;
@@ -71,6 +71,7 @@ type WorkloadStdinSender = StreamingInput;
 type WorkloadStdinMap = Arc<RwLock<HashMap<String, WorkloadStdinSender>>>;
 type WorkloadStopSender = oneshot::Sender<()>;
 type WorkloadStopMap = Arc<RwLock<HashMap<String, WorkloadStopSender>>>;
+type LogReopenMap = Arc<RwLock<HashMap<String, Arc<Notify>>>>;
 type ContainerEventSender = broadcast::Sender<ContainerEventResponse>;
 
 const CRI_CONTAINER_ROOTFS_HOST_DIR: &str = "cri-container-rootfs";
@@ -125,6 +126,8 @@ pub struct BoxRuntimeService {
     workload_stdins: WorkloadStdinMap,
     /// Best-effort stop controls for running CRI container workloads.
     workload_stops: WorkloadStopMap,
+    /// Per-container signals for CRI ReopenContainerLog (log rotation).
+    log_reopens: LogReopenMap,
     /// Broadcasts CRI container lifecycle events to GetContainerEvents streams.
     container_events: ContainerEventSender,
     /// Optional warm pool for instant VM acquisition.
@@ -170,6 +173,7 @@ impl BoxRuntimeService {
             attach_streams: Arc::new(RwLock::new(HashMap::new())),
             workload_stdins: Arc::new(RwLock::new(HashMap::new())),
             workload_stops: Arc::new(RwLock::new(HashMap::new())),
+            log_reopens: Arc::new(RwLock::new(HashMap::new())),
             container_events: broadcast::channel(CONTAINER_EVENT_BUFFER).0,
             warm_pool: None,
             runtime_options: CriRuntimeOptions::default(),
@@ -449,10 +453,12 @@ impl RuntimeService for BoxRuntimeService {
             let mut attach_streams = self.attach_streams.write().await;
             let mut workload_stdins = self.workload_stdins.write().await;
             let mut workload_stops = self.workload_stops.write().await;
+            let mut log_reopens = self.log_reopens.write().await;
             for container in &containers {
                 attach_streams.remove(&container.id);
                 workload_stdins.remove(&container.id);
                 workload_stops.remove(&container.id);
+                log_reopens.remove(&container.id);
             }
         }
 
@@ -496,10 +502,12 @@ impl RuntimeService for BoxRuntimeService {
             let mut attach_streams = self.attach_streams.write().await;
             let mut workload_stdins = self.workload_stdins.write().await;
             let mut workload_stops = self.workload_stops.write().await;
+            let mut log_reopens = self.log_reopens.write().await;
             for container in &removed_containers {
                 attach_streams.remove(&container.id);
                 workload_stdins.remove(&container.id);
                 workload_stops.remove(&container.id);
+                log_reopens.remove(&container.id);
             }
         }
         for container in &removed_containers {
@@ -947,6 +955,7 @@ impl RuntimeService for BoxRuntimeService {
 
         let (attach_tx, _) = broadcast::channel(128);
         let (stop_tx, stop_rx) = oneshot::channel();
+        let log_reopen = Arc::new(Notify::new());
         if started {
             self.attach_streams
                 .write()
@@ -962,6 +971,10 @@ impl RuntimeService for BoxRuntimeService {
                 .write()
                 .await
                 .insert(container_id.clone(), stop_tx);
+            self.log_reopens
+                .write()
+                .await
+                .insert(container_id.clone(), log_reopen.clone());
             self.emit_container_event(
                 &container_id,
                 &container.sandbox_id,
@@ -977,12 +990,14 @@ impl RuntimeService for BoxRuntimeService {
             attach_streams: self.attach_streams.clone(),
             workload_stdins: self.workload_stdins.clone(),
             workload_stops: self.workload_stops.clone(),
+            log_reopens: self.log_reopens.clone(),
             container_events: self.container_events.clone(),
             container_id: container_id.clone(),
             sandbox_id: container.sandbox_id.clone(),
             log_path: container.log_path.clone(),
             attach_tx,
             stop_rx,
+            log_reopen,
             workload,
         });
 
@@ -1067,6 +1082,7 @@ impl RuntimeService for BoxRuntimeService {
         self.attach_streams.write().await.remove(container_id);
         self.workload_stdins.write().await.remove(container_id);
         self.workload_stops.write().await.remove(container_id);
+        self.log_reopens.write().await.remove(container_id);
 
         Ok(Response::new(StopContainerResponse {}))
     }
@@ -1095,6 +1111,7 @@ impl RuntimeService for BoxRuntimeService {
             self.attach_streams.write().await.remove(container_id);
             self.workload_stdins.write().await.remove(container_id);
             self.workload_stops.write().await.remove(container_id);
+        self.log_reopens.write().await.remove(container_id);
             let event_time = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             self.emit_container_event(
                 &removed.id,
@@ -2118,23 +2135,12 @@ impl RuntimeService for BoxRuntimeService {
             "CRI ReopenContainerLog"
         );
 
-        // If the container has a log path, signal log rotation by truncating
-        // the existing log file. The guest agent will continue writing to it.
-        if !container.log_path.is_empty() {
-            let log_path = std::path::Path::new(&container.log_path);
-            if log_path.exists() {
-                if let Err(e) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(log_path)
-                {
-                    tracing::warn!(
-                        container_id = %container_id,
-                        error = %e,
-                        "Failed to truncate container log"
-                    );
-                }
-            }
+        // Signal the container's supervisor to reopen its log writer at
+        // `log_path`. The kubelet rotates by renaming the current file before
+        // calling this, so the supervisor must drop the stale handle and open a
+        // fresh file at the original path (see `CriLogWriter::reopen`).
+        if let Some(reopen) = self.log_reopens.read().await.get(container_id) {
+            reopen.notify_one();
         }
 
         Ok(Response::new(ReopenContainerLogResponse {}))

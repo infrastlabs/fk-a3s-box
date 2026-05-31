@@ -7,6 +7,7 @@ use tokio::io::AsyncWriteExt;
 
 pub(super) struct CriLogWriter {
     file: tokio::fs::File,
+    path: String,
     stdout_partial: Vec<u8>,
     stderr_partial: Vec<u8>,
 }
@@ -33,9 +34,30 @@ impl CriLogWriter {
 
         Ok(Some(Self {
             file,
+            path: log_path.to_string(),
             stdout_partial: Vec::new(),
             stderr_partial: Vec::new(),
         }))
+    }
+
+    /// Reopen the log file at its path (CRI `ReopenContainerLog`). The kubelet
+    /// rotates by renaming the current file, then calls this; we flush, drop the
+    /// old handle, and open a fresh file at the original path so subsequent
+    /// output lands where the kubelet now expects it.
+    pub(super) async fn reopen(&mut self) -> std::io::Result<()> {
+        self.flush_partials().await?;
+        if let Some(parent) = std::path::Path::new(&self.path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        self.file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await?;
+        Ok(())
     }
 
     pub(super) async fn write_chunk(

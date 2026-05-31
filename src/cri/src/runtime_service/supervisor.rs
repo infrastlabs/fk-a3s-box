@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 
 use crate::cri_api::ContainerEventType;
 use crate::persistent_store::PersistentCriStore;
@@ -14,7 +14,8 @@ use crate::persistent_store::PersistentCriStore;
 use super::convert::container_event_response;
 use super::log_writer::CriLogWriter;
 use super::{
-    AttachStreamMap, AttachStreamSender, ContainerEventSender, WorkloadStdinMap, WorkloadStopMap,
+    AttachStreamMap, AttachStreamSender, ContainerEventSender, LogReopenMap, WorkloadStdinMap,
+    WorkloadStopMap,
 };
 
 pub(super) enum SupervisedWorkload {
@@ -45,12 +46,14 @@ pub(super) struct ContainerExitSupervisor {
     pub(super) attach_streams: AttachStreamMap,
     pub(super) workload_stdins: WorkloadStdinMap,
     pub(super) workload_stops: WorkloadStopMap,
+    pub(super) log_reopens: LogReopenMap,
     pub(super) container_events: ContainerEventSender,
     pub(super) container_id: String,
     pub(super) sandbox_id: String,
     pub(super) log_path: String,
     pub(super) attach_tx: AttachStreamSender,
     pub(super) stop_rx: oneshot::Receiver<()>,
+    pub(super) log_reopen: Arc<Notify>,
     pub(super) workload: SupervisedWorkload,
 }
 
@@ -61,12 +64,14 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
             attach_streams,
             workload_stdins,
             workload_stops,
+            log_reopens,
             container_events,
             container_id,
             sandbox_id,
             log_path,
             attach_tx,
             stop_rx,
+            log_reopen,
             workload,
         } = supervisor;
         let mut workload = workload;
@@ -89,6 +94,26 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
 
         loop {
             tokio::select! {
+                _ = log_reopen.notified() => {
+                    // CRI ReopenContainerLog: the kubelet rotated (renamed) the
+                    // log file; reopen our writer at log_path so new output lands
+                    // in a fresh file there.
+                    match log_writer.as_mut() {
+                        Some(writer) => {
+                            if let Err(error) = writer.reopen().await {
+                                tracing::warn!(
+                                    container_id = %container_id,
+                                    log_path = %log_path,
+                                    error = %error,
+                                    "Failed to reopen CRI container log"
+                                );
+                            }
+                        }
+                        None => {
+                            log_writer = CriLogWriter::open(&log_path).await.ok().flatten();
+                        }
+                    }
+                }
                 stop = &mut stop_rx, if !stop_requested => {
                     stop_requested = true;
                     if stop.is_ok() {
@@ -201,5 +226,6 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
         attach_streams.write().await.remove(&container_id);
         workload_stdins.write().await.remove(&container_id);
         workload_stops.write().await.remove(&container_id);
+        log_reopens.write().await.remove(&container_id);
     });
 }
