@@ -153,7 +153,7 @@ pub async fn execute(args: MonitorArgs) -> Result<(), Box<dyn std::error::Error>
 /// Single poll iteration: load state, find dead boxes, restart eligible ones.
 /// Also checks for unhealthy boxes that have a restart policy.
 async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = StateFile::load_default()?;
+    let state = StateFile::load_default()?;
 
     // Track active boxes for stability detection.
     for record in state.records() {
@@ -162,7 +162,7 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
         }
     }
 
-    run_due_health_checks(&mut state).await?;
+    run_due_health_checks(&state).await?;
 
     // Find boxes that need restarting: dead boxes + unhealthy running boxes
     let mut candidates = state.pending_restarts();
@@ -198,14 +198,17 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
                 crate::process::graceful_stop(pid, libc::SIGTERM, 10).await;
             }
             tracker.mark_dead(&box_id);
-            // Mark as dead so boot_from_record works
-            if let Some(rec) = state.find_by_id_mut(&box_id) {
-                rec.status = "dead".to_string();
-                rec.pid = None;
-                rec.health_status = "none".to_string();
-                rec.health_retries = 0;
-            }
-            state.save()?;
+            // Mark as dead so boot_from_record works; re-load fresh under the
+            // lock and touch only this box's fields.
+            StateFile::modify(|s| {
+                if let Some(rec) = s.find_by_id_mut(&box_id) {
+                    rec.status = "dead".to_string();
+                    rec.pid = None;
+                    rec.health_status = "none".to_string();
+                    rec.health_retries = 0;
+                }
+                Ok::<(), std::io::Error>(())
+            })?;
         } else {
             tracker.mark_dead(&box_id);
             println!("{}", restart_log_line(&record, RestartReason::Dead));
@@ -214,15 +217,20 @@ async fn poll_once(tracker: &mut BackoffTracker) -> Result<(), Box<dyn std::erro
         // Attempt restart
         match boot::boot_from_record(&record).await {
             Ok(result) => {
-                // Update record to running
-                if let Some(rec) = state.find_by_id_mut(&box_id) {
-                    boot::apply_boot_result(rec, result, boot::RestartCountUpdate::Increment);
-                }
-                state.save()?;
+                // Re-load fresh under the lock and apply only this box's
+                // restart fields, returning the new restart count for logging.
+                let new_count = StateFile::modify(|s| {
+                    let count = if let Some(rec) = s.find_by_id_mut(&box_id) {
+                        boot::apply_boot_result(rec, result, boot::RestartCountUpdate::Increment);
+                        rec.restart_count
+                    } else {
+                        0
+                    };
+                    Ok::<u32, std::io::Error>(count)
+                })?;
                 tracker.record_attempt(&box_id);
                 println!(
-                    "monitor: box {name} ({short_id}) restarted (count: {})",
-                    state.find_by_id(&box_id).map_or(0, |r| r.restart_count),
+                    "monitor: box {name} ({short_id}) restarted (count: {new_count})",
                     name = record.name,
                     short_id = record.short_id,
                 );
@@ -288,7 +296,7 @@ fn format_exit_code(exit_code: Option<i32>) -> String {
 }
 
 #[cfg(not(windows))]
-async fn run_due_health_checks(state: &mut StateFile) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_due_health_checks(state: &StateFile) -> Result<(), Box<dyn std::error::Error>> {
     let now = chrono::Utc::now();
     let probes: Vec<_> = state
         .records()
@@ -316,17 +324,21 @@ async fn run_due_health_checks(state: &mut StateFile) -> Result<(), Box<dyn std:
             health::probe_timeout_ns(&health_check),
         )
         .await;
-        if let Some(record) = state.find_by_id_mut(&box_id) {
-            health::apply_probe_result(record, healthy, chrono::Utc::now());
-        }
+        // Re-load fresh under the lock and apply only this box's health fields,
+        // so concurrent CLI/health-checker writes are preserved.
+        StateFile::modify(|s| {
+            if let Some(record) = s.find_by_id_mut(&box_id) {
+                health::apply_probe_result(record, healthy, chrono::Utc::now());
+            }
+            Ok::<(), std::io::Error>(())
+        })?;
     }
 
-    state.save()?;
     Ok(())
 }
 
 #[cfg(windows)]
-async fn run_due_health_checks(_state: &mut StateFile) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_due_health_checks(_state: &StateFile) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 

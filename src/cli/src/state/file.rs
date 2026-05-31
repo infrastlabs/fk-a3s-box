@@ -41,13 +41,61 @@ impl StateFile {
         Self::load(&home.join("boxes.json"))
     }
 
-    /// Save state to disk atomically (write to .tmp, then rename).
+    /// Save state to disk atomically under the cross-process state lock.
     pub fn save(&self) -> Result<(), std::io::Error> {
+        let _lock = super::lock::StateLock::acquire()?;
+        self.write_to_disk()
+    }
+
+    /// Atomic write (tmp + rename) WITHOUT taking the state lock. Callers that
+    /// already hold the lock (`save`, `modify`, and `reconcile` which runs
+    /// inside `load`) use this to avoid re-locking (`flock` is not reentrant).
+    fn write_to_disk(&self) -> Result<(), std::io::Error> {
         let data = serde_json::to_string_pretty(&self.records).map_err(std::io::Error::other)?;
         let tmp_path = self.path.with_extension("json.tmp");
         std::fs::write(&tmp_path, &data)?;
         std::fs::rename(&tmp_path, &self.path)?;
         Ok(())
+    }
+
+    /// Atomically apply `f` to the on-disk state under the exclusive
+    /// cross-process lock: load fresh → mutate → save, all while the lock is
+    /// held. This is the race-free read-modify-write primitive — every writer
+    /// should mutate through it (or, for async work, snapshot inputs before the
+    /// await and call `modify` afterward to re-apply only its owned fields), so
+    /// the monitor/compose/health/CLI cannot clobber each other.
+    ///
+    /// `f` MUST be synchronous and MUST NOT `.await` (holding an OS lock across
+    /// a task yield would serialize or deadlock the async runtime).
+    pub fn modify<R, E>(f: impl FnOnce(&mut StateFile) -> Result<R, E>) -> Result<R, E>
+    where
+        E: From<std::io::Error>,
+    {
+        let _lock = super::lock::StateLock::acquire()?;
+        let mut sf = Self::load_default()?;
+        let out = f(&mut sf)?;
+        sf.write_to_disk()?;
+        Ok(out)
+    }
+
+    /// Append a record atomically under the state lock (load fresh → push →
+    /// save). Use this instead of `load_default()? + add()` so concurrent
+    /// appends/removals cannot lose records.
+    pub fn add_record(record: BoxRecord) -> Result<(), std::io::Error> {
+        Self::modify(|sf| {
+            sf.records.push(record);
+            Ok::<(), std::io::Error>(())
+        })
+    }
+
+    /// Remove a record by id atomically under the state lock. Returns whether a
+    /// record was removed.
+    pub fn remove_record(id: &str) -> Result<bool, std::io::Error> {
+        Self::modify(|sf| {
+            let before = sf.records.len();
+            sf.records.retain(|r| r.id != id);
+            Ok::<bool, std::io::Error>(sf.records.len() < before)
+        })
     }
 
     /// Add a record and persist.
@@ -158,7 +206,9 @@ impl StateFile {
         }
 
         if changed {
-            let _ = self.save();
+            // reconcile runs inside `load`, which `modify` calls while holding
+            // the state lock; use the unlocked write to avoid re-locking.
+            let _ = self.write_to_disk();
         }
 
         restart_candidates

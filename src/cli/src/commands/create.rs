@@ -157,14 +157,17 @@ pub async fn execute(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>>
     };
 
     let record_for_cleanup = record.clone();
-    let mut state = StateFile::load_default()?;
-    if let Err(error) = state.add(record) {
+    // Atomic append under the state lock so concurrent `create`/`run` cannot
+    // lose records (load_default()+add() is a lost-update race).
+    if let Err(error) = StateFile::add_record(record) {
+        let mut state = StateFile::load_default()?;
         crate::cleanup::cleanup_partial_box_record(&record_for_cleanup, Some(&mut state));
         return Err(error.into());
     }
 
     // Attach named volumes to this box
     if let Err(error) = super::volume::attach_volumes(&volume_names, &box_id) {
+        let mut state = StateFile::load_default()?;
         crate::cleanup::cleanup_partial_box_record(&record_for_cleanup, Some(&mut state));
         return Err(error);
     }
