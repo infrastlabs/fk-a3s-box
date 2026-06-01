@@ -32,6 +32,11 @@ All notable changes to A3S Box will be documented in this file.
   drop before exec.
 
 ### Fixed
+- The container log file is now created eagerly at `StartContainer` (instead of
+  lazily when the first output arrives), so a caller that opens the log
+  immediately after start — e.g. `ReopenContainerLog`, or before the container
+  has produced any output — finds it. Fixes the critest "reopening container
+  log" conformance spec.
 - CRI image identity now follows the digest, matching real runtimes:
   - `ListImages`/`ImageStatus` coalesce references by content digest, so an
     image with multiple tags appears once with all `repo_tags`.

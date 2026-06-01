@@ -51,6 +51,10 @@ pub(super) struct ContainerExitSupervisor {
     pub(super) container_id: String,
     pub(super) sandbox_id: String,
     pub(super) log_path: String,
+    /// The container log writer, opened eagerly by `start_container` so the
+    /// log file exists the moment `StartContainer` returns (a caller may open
+    /// it immediately, e.g. before the container has produced any output).
+    pub(super) log_writer: Option<CriLogWriter>,
     pub(super) attach_tx: AttachStreamSender,
     pub(super) stop_rx: oneshot::Receiver<()>,
     pub(super) log_reopen: Arc<Notify>,
@@ -70,6 +74,7 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
             container_id,
             sandbox_id,
             log_path,
+            log_writer,
             attach_tx,
             stop_rx,
             log_reopen,
@@ -79,19 +84,9 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
         let mut workload = workload;
         let mut stop_rx = stop_rx;
         let mut stop_requested = false;
-        let mut log_writer = match CriLogWriter::open(&log_path).await {
-            Ok(log_writer) => log_writer,
-            Err(error) => {
-                tracing::warn!(
-                    container_id = %container_id,
-                    sandbox_id = %sandbox_id,
-                    log_path = %log_path,
-                    error = %error,
-                    "Failed to open CRI container log"
-                );
-                None
-            }
-        };
+        // The writer was opened eagerly in start_container; the reopen path
+        // below re-creates it from log_path if it was never opened.
+        let mut log_writer = log_writer;
         let mut exit_code = -1;
 
         loop {

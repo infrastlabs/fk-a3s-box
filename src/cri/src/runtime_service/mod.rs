@@ -1277,6 +1277,16 @@ impl RuntimeService for BoxRuntimeService {
             );
         }
 
+        // Open (create) the container log file now, before StartContainer
+        // returns, so a caller that opens it immediately — e.g. critest's
+        // ReopenContainerLog test, before the container has produced any output
+        // — finds it. The supervisor would otherwise create it lazily in its
+        // task, racing the caller.
+        let log_writer = log_writer::CriLogWriter::open(&container.log_path)
+            .await
+            .ok()
+            .flatten();
+
         spawn_container_exit_supervisor(ContainerExitSupervisor {
             store: self.store.clone(),
             attach_streams: self.attach_streams.clone(),
@@ -1287,6 +1297,7 @@ impl RuntimeService for BoxRuntimeService {
             container_id: container_id.clone(),
             sandbox_id: container.sandbox_id.clone(),
             log_path: container.log_path.clone(),
+            log_writer,
             attach_tx,
             stop_rx,
             log_reopen,
