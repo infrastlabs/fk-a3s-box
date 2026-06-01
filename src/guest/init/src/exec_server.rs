@@ -487,6 +487,20 @@ fn build_command(
                 .collect()
         })
         .unwrap_or_default();
+    // CRI seccomp Localhost: A3S_SEC_SECCOMP_LOCALHOST=name,name lists the
+    // profile's SCMP_ACT_ERRNO syscalls (defaultAction=ALLOW). The guest builds
+    // an ERRNO filter for them.
+    let seccomp_localhost: Vec<String> = spec
+        .env
+        .iter()
+        .find_map(|entry| entry.strip_prefix("A3S_SEC_SECCOMP_LOCALHOST="))
+        .map(|csv| {
+            csv.split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     configure_child_process(
         &mut command,
         spec.rootfs,
@@ -495,6 +509,7 @@ fn build_command(
         supplemental_groups,
         apply_seccomp,
         cap_drop,
+        seccomp_localhost,
     );
     if spec.rootfs.is_none() {
         if let Some(dir) = spec.working_dir {
@@ -853,6 +868,7 @@ fn execute_command_streaming(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // cohesive child-process setup parameters
 fn configure_child_process(
     command: &mut std::process::Command,
     rootfs: Option<&str>,
@@ -861,6 +877,7 @@ fn configure_child_process(
     supplemental_groups: Vec<u32>,
     apply_seccomp: bool,
     cap_drop: Vec<String>,
+    seccomp_localhost: Vec<String>,
 ) {
     use std::ffi::CString;
     use std::os::unix::process::CommandExt;
@@ -877,13 +894,27 @@ fn configure_child_process(
 
     // Build the seccomp BPF filter BEFORE fork: building allocates, and
     // allocating in the post-fork child is not async-signal-safe (malloc may
-    // deadlock on musl). The child only installs the prebuilt filter.
+    // deadlock on musl). The child only installs the prebuilt filter. A
+    // Localhost profile (its SCMP_ACT_ERRNO syscalls) takes precedence over the
+    // RuntimeDefault filter.
     #[cfg(target_os = "linux")]
-    let seccomp_filter = apply_seccomp.then(crate::namespace::build_default_bpf_filter);
+    let seccomp_filter = if !seccomp_localhost.is_empty() {
+        let deny: Vec<u32> = seccomp_localhost
+            .iter()
+            .filter_map(|name| crate::namespace::syscall_name_to_number(name))
+            .collect();
+        Some(crate::namespace::build_seccomp_errno_filter(&deny))
+    } else if apply_seccomp {
+        Some(crate::namespace::build_default_bpf_filter())
+    } else {
+        None
+    };
     #[cfg(not(target_os = "linux"))]
-    let _ = apply_seccomp;
-    #[cfg(not(target_os = "linux"))]
-    let _ = &cap_drop;
+    {
+        let _ = apply_seccomp;
+        let _ = &cap_drop;
+        let _ = &seccomp_localhost;
+    }
 
     unsafe {
         command.pre_exec(move || {
@@ -941,6 +972,7 @@ fn configure_child_process(
     _supplemental_groups: Vec<u32>,
     _apply_seccomp: bool,
     _cap_drop: Vec<String>,
+    _seccomp_localhost: Vec<String>,
 ) {
 }
 

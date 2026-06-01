@@ -1774,6 +1774,33 @@ async fn test_create_container_materializes_writable_mount() {
     assert_eq!(std::fs::read_to_string(mounted_file).unwrap(), "data");
 }
 
+#[test]
+fn test_parse_localhost_seccomp_deny_allow_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("block-chmod.json");
+    std::fs::write(
+        &path,
+        r#"{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["chmod","fchmodat"],"action":"SCMP_ACT_ERRNO"}]}"#,
+    )
+    .unwrap();
+    let deny = super::parse_localhost_seccomp_deny(path.to_str().unwrap()).unwrap();
+    assert_eq!(deny, vec!["chmod".to_string(), "fchmodat".to_string()]);
+}
+
+#[test]
+fn test_parse_localhost_seccomp_deny_rejects_deny_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deny-default.json");
+    std::fs::write(
+        &path,
+        r#"{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[]}"#,
+    )
+    .unwrap();
+    // Deny-by-default profiles need a full allow-list; not supported -> Err so
+    // the caller falls back to RuntimeDefault rather than running unconfined.
+    assert!(super::parse_localhost_seccomp_deny(path.to_str().unwrap()).is_err());
+}
+
 #[tokio::test]
 async fn test_create_container_requires_pulled_image() {
     let svc = make_test_service();

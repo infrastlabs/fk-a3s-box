@@ -627,32 +627,10 @@ pub(crate) fn install_seccomp_filter(filter: &[libc::sock_filter]) -> Result<(),
     Ok(())
 }
 
-/// Build the default BPF seccomp filter.
-///
-/// Returns SECCOMP_RET_ERRNO(EPERM) for blocked syscalls,
-/// SECCOMP_RET_ALLOW for everything else.
+/// Build the default (RuntimeDefault) BPF seccomp filter: allow-default with
+/// `ERRNO(EPERM)` for the dangerous syscalls listed below.
 #[cfg(target_os = "linux")]
 pub(crate) fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
-    // BPF constants
-    const BPF_LD: u16 = 0x00;
-    const BPF_W: u16 = 0x00;
-    const BPF_ABS: u16 = 0x20;
-    const BPF_JMP: u16 = 0x05;
-    const BPF_JEQ: u16 = 0x10;
-    const BPF_K: u16 = 0x00;
-    const BPF_RET: u16 = 0x06;
-
-    // SECCOMP return values
-    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    const SECCOMP_RET_ERRNO_EPERM: u32 = 0x0005_0001; // SECCOMP_RET_ERRNO | EPERM
-    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
-
-    // Architecture audit value for seccomp_data.arch
-    #[cfg(target_arch = "x86_64")]
-    const AUDIT_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
-    #[cfg(target_arch = "aarch64")]
-    const AUDIT_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
-
     // Blocked syscall numbers (x86_64)
     #[cfg(target_arch = "x86_64")]
     let blocked_syscalls: &[u32] = &[
@@ -694,6 +672,35 @@ pub(crate) fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
         280, // bpf
         282, // userfaultfd
     ];
+
+    build_seccomp_errno_filter(blocked_syscalls)
+}
+
+/// Build an allow-default seccomp BPF filter that returns `ERRNO(EPERM)` for the
+/// given blocked syscall numbers. Shared by [`build_default_bpf_filter`] and CRI
+/// localhost profiles, which are `defaultAction: SCMP_ACT_ALLOW` plus a list of
+/// `SCMP_ACT_ERRNO` syscalls.
+#[cfg(target_os = "linux")]
+pub(crate) fn build_seccomp_errno_filter(blocked_syscalls: &[u32]) -> Vec<libc::sock_filter> {
+    // BPF constants
+    const BPF_LD: u16 = 0x00;
+    const BPF_W: u16 = 0x00;
+    const BPF_ABS: u16 = 0x20;
+    const BPF_JMP: u16 = 0x05;
+    const BPF_JEQ: u16 = 0x10;
+    const BPF_K: u16 = 0x00;
+    const BPF_RET: u16 = 0x06;
+
+    // SECCOMP return values
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    const SECCOMP_RET_ERRNO_EPERM: u32 = 0x0005_0001; // SECCOMP_RET_ERRNO | EPERM
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+
+    // Architecture audit value for seccomp_data.arch
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
 
     let num_blocked = blocked_syscalls.len();
     // +5: arch_load, arch_check, syscall_load, allow, deny
@@ -760,6 +767,45 @@ pub(crate) fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
     });
 
     filter
+}
+
+/// Map an OCI seccomp syscall name to its number for the guest architecture.
+///
+/// Covers the syscalls used by the CRI localhost-profile conformance plus a few
+/// common ones; unknown names return `None` and are skipped (best-effort —
+/// a profile entry the runtime can't map simply isn't enforced). On aarch64 the
+/// legacy `chmod` syscall does not exist (libc uses `fchmodat`), so it maps to
+/// `None` there.
+#[cfg(target_os = "linux")]
+pub(crate) fn syscall_name_to_number(name: &str) -> Option<u32> {
+    #[cfg(target_arch = "x86_64")]
+    let n: u32 = match name {
+        "chmod" => 90,
+        "fchmod" => 91,
+        "fchmodat" => 268,
+        "sethostname" => 170,
+        "setdomainname" => 171,
+        "mount" => 165,
+        "umount2" => 166,
+        "chroot" => 161,
+        "ptrace" => 101,
+        "reboot" => 169,
+        _ => return None,
+    };
+    #[cfg(target_arch = "aarch64")]
+    let n: u32 = match name {
+        "fchmod" => 52,
+        "fchmodat" => 53,
+        "sethostname" => 161,
+        "setdomainname" => 162,
+        "mount" => 40,
+        "umount2" => 39,
+        "chroot" => 51,
+        "ptrace" => 117,
+        "reboot" => 142,
+        _ => return None,
+    };
+    Some(n)
 }
 
 /// Child process logic for non-Linux platforms (development stub).
