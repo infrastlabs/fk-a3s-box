@@ -17,6 +17,10 @@ All notable changes to A3S Box will be documented in this file.
 - CRI pod DNS config: a pod's `DNSConfig` (servers, searches, options) is
   captured on the sandbox and rendered into each container's `/etc/resolv.conf`
   (falling back to the default when unset).
+- Image-defined supplemental groups: when a container runs as a specific user,
+  the guest applies the groups that user belongs to per the image's `/etc/group`
+  (runc-style initgroups) and defaults the primary gid to the user's
+  `/etc/passwd` group when no `RunAsGroup` is set.
 
 ### Fixed
 - CRI image identity now follows the digest, matching real runtimes:

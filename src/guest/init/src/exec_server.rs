@@ -364,7 +364,7 @@ fn build_command(
         .user
         .zip(spec.rootfs)
         .and_then(|(user, rootfs)| crate::user::resolve_named_user(user, rootfs));
-    let process_user = match parse_process_user(resolved_user.as_deref().or(spec.user)) {
+    let mut process_user = match parse_process_user(resolved_user.as_deref().or(spec.user)) {
         Ok(process_user) => process_user,
         Err(error) => {
             return Err(ExecOutput {
@@ -374,6 +374,14 @@ fn build_command(
             });
         }
     };
+    // When a user is set without an explicit group (RunAsUser, no RunAsGroup),
+    // default the primary gid to the user's /etc/passwd group — matching how a
+    // normal login derives the primary group — instead of inheriting root's.
+    if let (Some(process_user), Some(rootfs)) = (process_user.as_mut(), spec.rootfs) {
+        if process_user.gid.is_none() {
+            process_user.gid = crate::user::primary_gid_for_uid(rootfs, process_user.uid);
+        }
+    }
 
     if let Some(rootfs) = spec.rootfs {
         if rootfs.is_empty()
@@ -466,7 +474,7 @@ fn build_command(
 
     // CRI SupplementalGroups arrive as A3S_SEC_SUPPLEMENTAL_GROUPS=gid,gid,...
     // and are applied (setgroups) before dropping to the target uid/gid.
-    let supplemental_groups: Vec<u32> = spec
+    let mut supplemental_groups: Vec<u32> = spec
         .env
         .iter()
         .find_map(|entry| entry.strip_prefix("A3S_SEC_SUPPLEMENTAL_GROUPS="))
@@ -476,6 +484,20 @@ fn build_command(
                 .collect()
         })
         .unwrap_or_default();
+    // runc-style initgroups: when running as a specific user, add the groups
+    // that user belongs to per the image's /etc/group (resolved here, pre-fork).
+    // CRI-supplied groups take precedence; image groups are appended + deduped.
+    if let (Some(process_user), Some(rootfs)) = (process_user, spec.rootfs) {
+        let image_groups = crate::user::resolve_image_groups(
+            rootfs,
+            process_user.uid,
+            process_user.gid,
+            spec.user.unwrap_or("root"),
+        );
+        supplemental_groups.extend(image_groups);
+        let mut seen = std::collections::HashSet::new();
+        supplemental_groups.retain(|gid| seen.insert(*gid));
+    }
     // CRI seccomp: A3S_SEC_SECCOMP=default applies the default BPF filter
     // (RuntimeDefault) in the child; unconfined/unset leave the process
     // unfiltered.
