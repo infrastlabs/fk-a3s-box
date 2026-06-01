@@ -925,6 +925,12 @@ impl RuntimeService for BoxRuntimeService {
                     ));
                 }
             }
+            // no_new_privs: the guest sets PR_SET_NO_NEW_PRIVS before exec so a
+            // setuid/setgid (or file-capability) binary can no longer raise the
+            // process's privileges. Privileged containers opt out.
+            if sc.no_new_privs && !sc.privileged {
+                env.push(("A3S_SEC_NO_NEW_PRIVS".to_string(), "1".to_string()));
+            }
         }
         let user = container_user_from_linux_config(config.linux.as_ref())
             .or_else(|| image_config.and_then(|image| image.user.clone()));

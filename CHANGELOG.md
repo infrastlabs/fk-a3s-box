@@ -8,6 +8,9 @@ All notable changes to A3S Box will be documented in this file.
 - Registry mirrors: `A3S_REGISTRY_MIRRORS=host=mirror,...` pulls image content
   from a configured mirror while preserving the canonical image identity in the
   store (e.g. fetch `registry.k8s.io`/`gcr.io` images via an accessible mirror).
+- CRI `SecurityContext.no_new_privs`: the guest sets `PR_SET_NO_NEW_PRIVS`
+  before exec, so a setuid/setgid or file-capability binary can no longer raise
+  the container process's privileges (privileged containers opt out).
 
 ### Fixed
 - CRI image identity now follows the digest, matching real runtimes:

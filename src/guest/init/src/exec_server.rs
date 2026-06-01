@@ -501,6 +501,12 @@ fn build_command(
                 .collect()
         })
         .unwrap_or_default();
+    // CRI no_new_privs: A3S_SEC_NO_NEW_PRIVS=1 sets PR_SET_NO_NEW_PRIVS in the
+    // child before exec, so a setuid/file-capability binary cannot raise privs.
+    let no_new_privs = spec
+        .env
+        .iter()
+        .any(|entry| entry == "A3S_SEC_NO_NEW_PRIVS=1");
     configure_child_process(
         &mut command,
         spec.rootfs,
@@ -510,6 +516,7 @@ fn build_command(
         apply_seccomp,
         cap_drop,
         seccomp_localhost,
+        no_new_privs,
     );
     if spec.rootfs.is_none() {
         if let Some(dir) = spec.working_dir {
@@ -878,6 +885,7 @@ fn configure_child_process(
     apply_seccomp: bool,
     cap_drop: Vec<String>,
     seccomp_localhost: Vec<String>,
+    no_new_privs: bool,
 ) {
     use std::ffi::CString;
     use std::os::unix::process::CommandExt;
@@ -914,6 +922,7 @@ fn configure_child_process(
         let _ = apply_seccomp;
         let _ = &cap_drop;
         let _ = &seccomp_localhost;
+        let _ = no_new_privs;
     }
 
     unsafe {
@@ -951,6 +960,13 @@ fn configure_child_process(
             if !cap_drop.is_empty() {
                 crate::namespace::drop_capabilities(&cap_drop)?;
             }
+            // Set no_new_privs before installing seccomp: a single prctl
+            // (async-signal-safe) that prevents any later execve from gaining
+            // privileges via setuid/setgid bits or file capabilities.
+            #[cfg(target_os = "linux")]
+            if no_new_privs {
+                crate::namespace::set_no_new_privs()?;
+            }
             // Install the seccomp filter last — after chroot and the privilege
             // drop — so it is active across execve. Only the prebuilt filter is
             // installed here; no allocation happens in the post-fork child.
@@ -973,6 +989,7 @@ fn configure_child_process(
     _apply_seccomp: bool,
     _cap_drop: Vec<String>,
     _seccomp_localhost: Vec<String>,
+    _no_new_privs: bool,
 ) {
 }
 

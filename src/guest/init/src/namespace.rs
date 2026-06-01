@@ -390,6 +390,21 @@ fn should_drop_caps(cap_drop: &[String]) -> bool {
     !cap_drop.is_empty()
 }
 
+/// Set `PR_SET_NO_NEW_PRIVS` on the calling thread.
+///
+/// **Async-signal-safe**: a single `prctl` syscall, safe to call in the
+/// post-`fork` child. Once set, no subsequent `execve` can gain privileges via
+/// setuid/setgid bits or file capabilities, and the bit is preserved across the
+/// exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_no_new_privs() -> Result<(), std::io::Error> {
+    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Drop Linux capabilities using prctl.
 ///
 /// Drops capabilities from the bounding set AND clears the effective,
