@@ -61,10 +61,30 @@ fn parse_sysctls(config: &PodSandboxConfig) -> Vec<(String, String)> {
     let mut sysctls: Vec<(String, String)> = linux
         .sysctls
         .iter()
+        .filter(|(name, _)| {
+            let safe = is_safe_sysctl_name(name);
+            if !safe {
+                tracing::warn!(sysctl = %name, "Dropping sysctl with an unsafe name");
+            }
+            safe
+        })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
     sysctls.sort();
     sysctls
+}
+
+/// A sysctl name is safe to map onto `/proc/sys/<name with '.'→'/'>` only if it
+/// is a non-empty dot-separated key with no path-traversal characters. Guards
+/// against a crafted name (e.g. `../../proc/sysrq-trigger`) escaping
+/// `/proc/sys` when the guest substitutes `.` for `/`.
+fn is_safe_sysctl_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.split('.').any(|seg| seg.is_empty() || seg == "..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn parse_hostname(config: &PodSandboxConfig) -> Result<Option<String>> {

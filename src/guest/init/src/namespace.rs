@@ -324,9 +324,19 @@ fn apply_security_before_exec(cmd: &mut Command) -> Result<(), NamespaceError> {
     let seccomp_mode = config.seccomp.clone();
     let cap_drop = config.cap_drop.clone();
 
+    // Build the seccomp BPF filter BEFORE fork. Building allocates, which is
+    // not async-signal-safe in the post-fork child (malloc may deadlock on
+    // musl); the child only installs the prebuilt filter.
+    let seccomp_filter = if matches!(seccomp_mode, SeccompMode::Default) {
+        Some(build_default_bpf_filter())
+    } else {
+        None
+    };
+
     // Use pre_exec to apply security in the child process right before exec
     // SAFETY: pre_exec runs after fork, before exec. We only call
-    // async-signal-safe operations (prctl, seccomp).
+    // async-signal-safe operations (prctl, seccomp) — the seccomp filter is
+    // built above, pre-fork.
     unsafe {
         cmd.pre_exec(move || {
             // 1. Set no-new-privileges
@@ -342,10 +352,12 @@ fn apply_security_before_exec(cmd: &mut Command) -> Result<(), NamespaceError> {
                 drop_capabilities(&cap_drop)?;
             }
 
-            // 3. Apply seccomp filter
+            // 3. Apply seccomp filter (prebuilt before fork)
             match &seccomp_mode {
                 SeccompMode::Default => {
-                    apply_default_seccomp()?;
+                    if let Some(filter) = &seccomp_filter {
+                        install_seccomp_filter(filter)?;
+                    }
                 }
                 SeccompMode::Unconfined => {
                     // No seccomp filter
@@ -496,38 +508,26 @@ fn cap_name_to_number(name: &str) -> Option<i32> {
 ///
 /// Based on Docker's default seccomp profile — blocks syscalls that could
 /// escape the sandbox or compromise the host.
+/// Install a prebuilt seccomp BPF filter on the current thread.
+///
+/// **Async-signal-safe**: performs only `prctl` and the `seccomp` syscall and
+/// reads the caller-owned `filter` slice — it does NOT allocate. It is therefore
+/// safe to call from a post-fork `pre_exec` hook PROVIDED the filter was built
+/// *before* the fork (see [`build_default_bpf_filter`]); building the filter
+/// allocates and must never run in the child of a multi-threaded process.
+///
+/// Sets `PR_SET_NO_NEW_PRIVS` (required for unprivileged seccomp) then loads the
+/// filter via `SECCOMP_SET_MODE_FILTER`, putting the process in
+/// `SECCOMP_MODE_FILTER` (`/proc/self/status` `Seccomp: 2`). The default filter
+/// returns `EPERM` for the syscalls listed in [`build_default_bpf_filter`].
 #[cfg(target_os = "linux")]
-pub(crate) fn apply_default_seccomp() -> Result<(), std::io::Error> {
-    // Use SECCOMP_SET_MODE_FILTER via prctl
-    // The default profile uses a BPF filter that blocks:
-    // - kexec_load, kexec_file_load (kernel replacement)
-    // - reboot (system reboot)
-    // - mount, umount2 (filesystem manipulation — unless in mount namespace)
-    // - pivot_root, chroot (filesystem escape)
-    // - swapon, swapoff (swap manipulation)
-    // - init_module, finit_module, delete_module (kernel modules)
-    // - acct (process accounting)
-    // - settimeofday, clock_settime (time manipulation)
-    // - personality (execution domain change)
-    // - keyctl (kernel keyring)
-    // - ptrace (process tracing — unless CAP_SYS_PTRACE)
-    // - userfaultfd (memory manipulation)
-    // - perf_event_open (performance monitoring)
-    // - bpf (eBPF programs)
-    // - unshare (namespace creation — already in namespace)
-    // - setns (namespace switching)
-
-    // Build BPF filter program
-    let filter = build_default_bpf_filter();
-
-    // Install the filter via prctl + seccomp
-    // First, ensure no-new-privs is set (required for unprivileged seccomp)
+pub(crate) fn install_seccomp_filter(filter: &[libc::sock_filter]) -> Result<(), std::io::Error> {
+    // First, ensure no-new-privs is set (required for unprivileged seccomp).
     let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
     }
 
-    // SECCOMP_SET_MODE_FILTER = 1, SECCOMP_FILTER_FLAG_TSYNC = 1
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -547,7 +547,7 @@ pub(crate) fn apply_default_seccomp() -> Result<(), std::io::Error> {
 /// Returns SECCOMP_RET_ERRNO(EPERM) for blocked syscalls,
 /// SECCOMP_RET_ALLOW for everything else.
 #[cfg(target_os = "linux")]
-fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
+pub(crate) fn build_default_bpf_filter() -> Vec<libc::sock_filter> {
     // BPF constants
     const BPF_LD: u16 = 0x00;
     const BPF_W: u16 = 0x00;
