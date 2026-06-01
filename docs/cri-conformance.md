@@ -76,11 +76,23 @@ critest --runtime-endpoint unix:///tmp/a3s-box.sock \
 | **Capabilities** (~3) | add/drop capability, drop ALL | capabilities not managed per-container; `brctl` bridge test also needs a `CONFIG_BRIDGE` guest kernel | ⚠️ murky / possibly kernel-limited |
 | **MaskedPaths** (1) | mask `/bin/ls` | masking code is correct, but under the alpine/busybox substitution `/bin/ls` and `/bin/sh` are the same `busybox` binary, so masking `ls` breaks `sh`; the expected stderr needs `sh` to run | ❌ test-image artifact |
 
-## Stability
+## Stability & hardening
 
-- **Graceful shutdown:** on SIGTERM/SIGINT the CRI drains the gRPC server and
+- **Graceful shutdown:** on SIGTERM/SIGINT the CRI drains the gRPC server then
   reaps every sandbox VM (kills the shim, unmounts its overlay, removes the
-  rootfs dir) — no more orphaned microVMs/overlays across restarts.
+  rootfs dir) — no more orphaned microVMs/overlays across restarts. The reaper
+  runs even if the server exited with an error.
+- **Adversarial review (16 confirmed findings, all fixed):** caller-supplied
+  `A3S_SEC_*` env can no longer spoof the security envelope (privilege
+  escalation); the seccomp BPF filter is built before `fork` (no async-signal
+  unsafe allocation in the post-fork child — a musl malloc-deadlock risk);
+  MaskedPaths/ReadonlyPaths mounts are idempotent (no per-exec mount-leak);
+  MaskedPaths/ReadonlyPaths/sysctl names are path-traversal validated; misc
+  panic/leak/non-Linux-build fixes.
+- **ReopenContainerLog is synchronous** (waits for the supervisor to confirm the
+  reopen). Reduces — but does not fully eliminate — the "reopening container
+  log" flake; the residual race is guest→host log-transport ordering and needs
+  an exec-stream flush barrier.
 - **TODO:** SIGKILL/crash-case startup reaping (reconcile already marks orphaned
   sandboxes NotReady, but does not yet reap the dead instance's leftover shim
   processes + overlay mounts).
