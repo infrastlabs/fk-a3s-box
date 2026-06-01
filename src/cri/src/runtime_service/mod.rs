@@ -71,7 +71,16 @@ type WorkloadStdinSender = StreamingInput;
 type WorkloadStdinMap = Arc<RwLock<HashMap<String, WorkloadStdinSender>>>;
 type WorkloadStopSender = oneshot::Sender<()>;
 type WorkloadStopMap = Arc<RwLock<HashMap<String, WorkloadStopSender>>>;
-type LogReopenMap = Arc<RwLock<HashMap<String, Arc<Notify>>>>;
+/// Per-container handle for CRI ReopenContainerLog. `request` wakes the exit
+/// supervisor to reopen its log writer; `done` is notified once the reopen has
+/// completed, so ReopenContainerLog returns only after the new file is in place
+/// (the RPC is synchronous — output written after it returns must land in the
+/// rotated file).
+pub(super) struct LogReopenHandle {
+    pub(super) request: Arc<Notify>,
+    pub(super) done: Arc<Notify>,
+}
+type LogReopenMap = Arc<RwLock<HashMap<String, LogReopenHandle>>>;
 type ContainerEventSender = broadcast::Sender<ContainerEventResponse>;
 
 const CRI_CONTAINER_ROOTFS_HOST_DIR: &str = "cri-container-rootfs";
@@ -1059,6 +1068,7 @@ impl RuntimeService for BoxRuntimeService {
         let (attach_tx, _) = broadcast::channel(128);
         let (stop_tx, stop_rx) = oneshot::channel();
         let log_reopen = Arc::new(Notify::new());
+        let log_reopen_done = Arc::new(Notify::new());
         if started {
             self.attach_streams
                 .write()
@@ -1074,10 +1084,13 @@ impl RuntimeService for BoxRuntimeService {
                 .write()
                 .await
                 .insert(container_id.clone(), stop_tx);
-            self.log_reopens
-                .write()
-                .await
-                .insert(container_id.clone(), log_reopen.clone());
+            self.log_reopens.write().await.insert(
+                container_id.clone(),
+                LogReopenHandle {
+                    request: log_reopen.clone(),
+                    done: log_reopen_done.clone(),
+                },
+            );
             self.emit_container_event(
                 &container_id,
                 &container.sandbox_id,
@@ -1101,6 +1114,7 @@ impl RuntimeService for BoxRuntimeService {
             attach_tx,
             stop_rx,
             log_reopen,
+            log_reopen_done,
             workload,
         });
 
@@ -2254,11 +2268,34 @@ impl RuntimeService for BoxRuntimeService {
         );
 
         // Signal the container's supervisor to reopen its log writer at
-        // `log_path`. The kubelet rotates by renaming the current file before
-        // calling this, so the supervisor must drop the stale handle and open a
-        // fresh file at the original path (see `CriLogWriter::reopen`).
-        if let Some(reopen) = self.log_reopens.read().await.get(container_id) {
-            reopen.notify_one();
+        // `log_path` and WAIT for it to finish. The kubelet rotates by renaming
+        // the current file before calling this, so the supervisor must drop the
+        // stale handle and open a fresh file at the original path (see
+        // `CriLogWriter::reopen`). Returning synchronously guarantees output
+        // written after this RPC lands in the rotated file rather than racing
+        // the supervisor. Clone the notify handles out of the lock so we never
+        // hold it across the await.
+        let handles = {
+            let reopens = self.log_reopens.read().await;
+            reopens
+                .get(container_id)
+                .map(|handle| (handle.request.clone(), handle.done.clone()))
+        };
+        if let Some((request, done)) = handles {
+            // Register the done future BEFORE signalling so a fast supervisor
+            // cannot complete the reopen before we start waiting (notify_one
+            // also stores a permit, so there is no lost-wakeup either way).
+            let done = done.notified();
+            request.notify_one();
+            if tokio::time::timeout(std::time::Duration::from_secs(5), done)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    container_id = %container_id,
+                    "ReopenContainerLog timed out waiting for the supervisor to reopen the log"
+                );
+            }
         }
 
         Ok(Response::new(ReopenContainerLogResponse {}))
