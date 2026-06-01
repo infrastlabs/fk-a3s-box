@@ -3191,14 +3191,21 @@ async fn test_reopen_container_log_signals_supervisor() {
     let svc = make_test_service();
     svc.store.containers.add(test_container("c-1", "sb-1")).await;
 
-    // Register a reopen signal as StartContainer does for a running container.
+    // Register a reopen handle as StartContainer does for a running container.
     // The actual file reopen happens in the exit supervisor (integration-tested
-    // via critest); here we verify the RPC fires the per-container signal.
-    let signal = std::sync::Arc::new(tokio::sync::Notify::new());
-    svc.log_reopens
-        .write()
-        .await
-        .insert("c-1".to_string(), signal.clone());
+    // via critest); here we verify the RPC fires the per-container request and
+    // returns once the supervisor acks. Pre-arm `done` so the now-synchronous
+    // RPC does not block waiting for a supervisor that isn't running here.
+    let request = std::sync::Arc::new(tokio::sync::Notify::new());
+    let done = std::sync::Arc::new(tokio::sync::Notify::new());
+    done.notify_one();
+    svc.log_reopens.write().await.insert(
+        "c-1".to_string(),
+        super::LogReopenHandle {
+            request: request.clone(),
+            done: done.clone(),
+        },
+    );
 
     svc.reopen_container_log(Request::new(ReopenContainerLogRequest {
         container_id: "c-1".to_string(),
@@ -3206,10 +3213,11 @@ async fn test_reopen_container_log_signals_supervisor() {
     .await
     .unwrap();
 
-    // notify_one() stores a permit, so notified() resolves immediately.
-    tokio::time::timeout(std::time::Duration::from_secs(1), signal.notified())
+    // The RPC fired the per-container reopen request (notify_one stores a
+    // permit, so notified() resolves immediately).
+    tokio::time::timeout(std::time::Duration::from_secs(1), request.notified())
         .await
-        .expect("ReopenContainerLog should signal the container's reopen notify");
+        .expect("ReopenContainerLog should signal the container's reopen request");
 }
 
 // ── Stop/Remove Pod Sandbox (store-only, no VM) ──────────────────

@@ -54,6 +54,7 @@ pub(super) struct ContainerExitSupervisor {
     pub(super) attach_tx: AttachStreamSender,
     pub(super) stop_rx: oneshot::Receiver<()>,
     pub(super) log_reopen: Arc<Notify>,
+    pub(super) log_reopen_done: Arc<Notify>,
     pub(super) workload: SupervisedWorkload,
 }
 
@@ -72,6 +73,7 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
             attach_tx,
             stop_rx,
             log_reopen,
+            log_reopen_done,
             workload,
         } = supervisor;
         let mut workload = workload;
@@ -113,6 +115,9 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
                             log_writer = CriLogWriter::open(&log_path).await.ok().flatten();
                         }
                     }
+                    // Acknowledge so a synchronous ReopenContainerLog can return
+                    // only now that the new log file is in place.
+                    log_reopen_done.notify_one();
                 }
                 stop = &mut stop_rx, if !stop_requested => {
                     stop_requested = true;
