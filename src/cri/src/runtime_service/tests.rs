@@ -1681,6 +1681,13 @@ async fn test_create_container_success() {
                 "/usr/local/bin:/usr/bin:/bin".to_string()
             ),
             ("ENV".to_string(), "prod".to_string()),
+            // Non-privileged container: restricted to the default capability set.
+            (
+                "A3S_SEC_CAP_KEEP".to_string(),
+                "AUDIT_WRITE,CHOWN,DAC_OVERRIDE,FOWNER,FSETID,KILL,MKNOD,\
+                 NET_BIND_SERVICE,NET_RAW,SETFCAP,SETGID,SETPCAP,SETUID,SYS_CHROOT"
+                    .to_string()
+            ),
         ]
     );
     assert_eq!(c.working_dir, "/app");
