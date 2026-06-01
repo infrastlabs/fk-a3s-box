@@ -103,16 +103,18 @@ impl CriServer {
         // Keep a handle so we can reap sandbox VMs once the server stops; the
         // service itself is moved into the gRPC server below.
         let shutdown_service = runtime_service.clone();
-        Server::builder()
+        let result = Server::builder()
             .add_service(RuntimeServiceServer::new(runtime_service))
             .add_service(ImageServiceServer::new(image_service))
             .serve_with_incoming_shutdown(uds_stream, shutdown_signal())
-            .await?;
+            .await;
 
-        // The server stopped (SIGTERM/SIGINT): tear down sandbox VMs and unmount
-        // their overlays so they do not orphan across restarts.
+        // The server stopped — on graceful signal (Ok) OR a transport error.
+        // Reap sandbox VMs + unmount overlays unconditionally so they do not
+        // orphan across restarts, then surface any server error.
         tracing::info!("CRI server stopping — reaping sandbox VMs");
         shutdown_service.shutdown_all_sandboxes().await;
+        result?;
 
         Ok(())
     }

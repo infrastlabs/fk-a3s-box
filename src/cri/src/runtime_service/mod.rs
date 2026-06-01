@@ -764,6 +764,12 @@ impl RuntimeService for BoxRuntimeService {
             .map(|image| image.env.as_slice())
             .unwrap_or(&[]);
         let mut env = merge_env(image_env, &config.envs);
+        // A3S_SEC_* is the runtime's TRUSTED security envelope. Strip any
+        // image- or pod-supplied A3S_SEC_* entry first: the guest matches these
+        // keys first-wins, so a caller-controlled value would otherwise
+        // override the runtime's (escalating supplemental groups, unmasking
+        // paths, or toggling seccomp). Only runtime-derived values may set them.
+        env.retain(|(key, _)| !key.starts_with("A3S_SEC_"));
         let working_dir = if config.working_dir.is_empty() {
             image_config
                 .and_then(|image| image.working_dir.clone())
@@ -814,8 +820,20 @@ impl RuntimeService for BoxRuntimeService {
             // unconfined. Localhost profiles are not yet plumbed into the VM.
             if let Some(profile) = sc.seccomp.as_ref() {
                 use crate::cri_api::security_profile::ProfileType;
-                if profile.profile_type() == ProfileType::RuntimeDefault {
-                    env.push(("A3S_SEC_SECCOMP".to_string(), "default".to_string()));
+                match profile.profile_type() {
+                    ProfileType::RuntimeDefault => {
+                        env.push(("A3S_SEC_SECCOMP".to_string(), "default".to_string()));
+                    }
+                    ProfileType::Localhost => {
+                        // Not yet plumbed into the VM — warn rather than
+                        // silently downgrading to unconfined.
+                        tracing::warn!(
+                            container = %metadata.name,
+                            profile = %profile.localhost_ref,
+                            "Localhost seccomp profiles are not yet supported; container runs without the requested profile"
+                        );
+                    }
+                    ProfileType::Unconfined => {}
                 }
             }
         }

@@ -445,6 +445,11 @@ fn build_command(
 
     for entry in spec.env {
         if let Some((key, value)) = entry.split_once('=') {
+            // A3S_SEC_* are runtime control vars (consumed below for setgroups /
+            // masked paths / seccomp); don't leak them into the workload's env.
+            if key.starts_with("A3S_SEC_") {
+                continue;
+            }
             command.env(key, value);
         }
     }
@@ -848,6 +853,14 @@ fn configure_child_process(
         .map(|rootfs| CString::new(rootfs.as_bytes()).expect("rootfs path was pre-validated"));
     let workdir = CString::new(workdir.as_bytes()).expect("working directory was pre-validated");
 
+    // Build the seccomp BPF filter BEFORE fork: building allocates, and
+    // allocating in the post-fork child is not async-signal-safe (malloc may
+    // deadlock on musl). The child only installs the prebuilt filter.
+    #[cfg(target_os = "linux")]
+    let seccomp_filter = apply_seccomp.then(crate::namespace::build_default_bpf_filter);
+    #[cfg(not(target_os = "linux"))]
+    let _ = apply_seccomp;
+
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
@@ -865,7 +878,7 @@ fn configure_child_process(
             // needs CAP_SETGID, which user.apply() drops via setuid below.
             if !supplemental_groups.is_empty() {
                 let ret = libc::setgroups(
-                    supplemental_groups.len() as libc::size_t,
+                    supplemental_groups.len() as _,
                     supplemental_groups.as_ptr() as *const libc::gid_t,
                 );
                 if ret != 0 {
@@ -876,14 +889,12 @@ fn configure_child_process(
                 user.apply()?;
             }
             // Install the seccomp filter last — after chroot and the privilege
-            // drop — so it is active across execve. The default filter allows
-            // execve and the syscalls the child still needs.
+            // drop — so it is active across execve. Only the prebuilt filter is
+            // installed here; no allocation happens in the post-fork child.
             #[cfg(target_os = "linux")]
-            if apply_seccomp {
-                crate::namespace::apply_default_seccomp()?;
+            if let Some(filter) = &seccomp_filter {
+                crate::namespace::install_seccomp_filter(filter)?;
             }
-            #[cfg(not(target_os = "linux"))]
-            let _ = apply_seccomp;
             Ok(())
         });
     }
@@ -966,8 +977,36 @@ fn parse_sec_path_list<'a>(env: &'a [String], prefix: &str) -> Vec<&'a str> {
 fn apply_container_path_restrictions(rootfs: &str, masked: &[&str], readonly: &[&str]) {
     use nix::mount::{mount, MsFlags};
 
+    use std::os::unix::fs::MetadataExt;
+
+    // Reject entries that are not safe absolute paths (must be rooted, no `..`
+    // component) so a crafted MaskedPaths/ReadonlyPaths value cannot escape the
+    // container rootfs through the join below.
+    let is_safe = |path: &str| path.starts_with('/') && !path.split('/').any(|c| c == "..");
+
+    // A target is already restricted if it is a distinct mount — its st_dev
+    // differs from its parent directory's. This makes re-application on every
+    // exec idempotent (build_command runs per-exec) instead of stacking mounts.
+    let is_mountpoint = |target: &str| -> bool {
+        let Ok(dev) = std::fs::metadata(target).map(|m| m.dev()) else {
+            return false;
+        };
+        std::path::Path::new(target)
+            .parent()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|pm| pm.dev() != dev)
+            .unwrap_or(false)
+    };
+
     for path in masked {
+        if !is_safe(path) {
+            warn!("Skipping unsafe masked path {path}");
+            continue;
+        }
         let target = format!("{rootfs}{path}");
+        if is_mountpoint(&target) {
+            continue; // already masked
+        }
         match std::fs::metadata(&target) {
             Ok(meta) if meta.is_dir() => {
                 if let Err(e) = mount(
@@ -996,8 +1035,20 @@ fn apply_container_path_restrictions(rootfs: &str, masked: &[&str], readonly: &[
     }
 
     for path in readonly {
+        if !is_safe(path) {
+            warn!("Skipping unsafe readonly path {path}");
+            continue;
+        }
         let target = format!("{rootfs}{path}");
         if !std::path::Path::new(&target).exists() {
+            continue;
+        }
+        // Idempotent: skip if already read-only — re-binding would stack mounts
+        // on every exec into the container.
+        if nix::sys::statvfs::statvfs(target.as_str())
+            .map(|s| s.flags().contains(nix::sys::statvfs::FsFlags::ST_RDONLY))
+            .unwrap_or(false)
+        {
             continue;
         }
         // A fresh bind is read-write regardless of the source, so bind then
