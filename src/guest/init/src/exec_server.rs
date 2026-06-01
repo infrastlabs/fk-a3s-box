@@ -1000,18 +1000,22 @@ fn configure_child_process(
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            if let Some(user) = user {
-                user.apply()?;
-            }
-            // Apply capabilities after the uid/gid switch (capset/prctl only —
-            // async-signal-safe). A keep-set (the CRI default for a
-            // non-privileged container) restricts to exactly those caps; the
-            // legacy drop-list path remains for explicit-drop-only callers.
+            // Apply capabilities BEFORE the uid/gid switch, while the process is
+            // still root and holds CAP_SETPCAP: capset / PR_CAPBSET_DROP require
+            // it, and a setuid to a non-root user clears the effective set and
+            // would make a later capset fail (breaking RunAsUser containers). A
+            // keep-set (the CRI default for a non-privileged container) reduces
+            // to exactly those caps; the legacy drop-list path remains for
+            // explicit-drop-only callers. The default keep-set retains
+            // CAP_SETUID/CAP_SETGID so the subsequent user.apply still works.
             #[cfg(target_os = "linux")]
             if let Some(cap_keep) = &cap_keep {
                 crate::namespace::restrict_capabilities_to_keep(cap_keep)?;
             } else if !cap_drop.is_empty() {
                 crate::namespace::drop_capabilities(&cap_drop)?;
+            }
+            if let Some(user) = user {
+                user.apply()?;
             }
             // Set no_new_privs before installing seccomp: a single prctl
             // (async-signal-safe) that prevents any later execve from gaining
