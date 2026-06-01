@@ -87,6 +87,54 @@ const CRI_CONTAINER_ROOTFS_HOST_DIR: &str = "cri-container-rootfs";
 const CRI_CONTAINER_ROOTFS_GUEST_BASE: &str = "/run/a3s/cri/container-rootfs";
 const CONTAINER_EVENT_BUFFER: usize = 1024;
 
+#[derive(serde::Deserialize)]
+struct OciSeccompProfile {
+    #[serde(rename = "defaultAction")]
+    default_action: String,
+    #[serde(default)]
+    syscalls: Vec<OciSeccompSyscall>,
+}
+
+#[derive(serde::Deserialize)]
+struct OciSeccompSyscall {
+    #[serde(default)]
+    names: Vec<String>,
+    action: String,
+}
+
+/// Parse a CRI localhost seccomp profile file and return the syscall names it
+/// blocks with `SCMP_ACT_ERRNO`/`SCMP_ACT_KILL*`.
+///
+/// Supports the conformance shape — a permissive default action
+/// (`SCMP_ACT_ALLOW`/`SCMP_ACT_LOG`) plus an ERRNO deny list. A deny-by-default
+/// profile (which would need a full allow-list compiled to BPF) is not yet
+/// supported; returns an error so the caller can fall back rather than silently
+/// run unconfined.
+fn parse_localhost_seccomp_deny(localhost_ref: &str) -> Result<Vec<String>, String> {
+    let raw = std::fs::read_to_string(localhost_ref)
+        .map_err(|e| format!("read seccomp profile {localhost_ref}: {e}"))?;
+    let profile: OciSeccompProfile =
+        serde_json::from_str(&raw).map_err(|e| format!("parse seccomp profile: {e}"))?;
+    if !matches!(profile.default_action.as_str(), "SCMP_ACT_ALLOW" | "SCMP_ACT_LOG") {
+        return Err(format!(
+            "unsupported seccomp defaultAction {} (only allow-default profiles are supported)",
+            profile.default_action
+        ));
+    }
+    let deny: Vec<String> = profile
+        .syscalls
+        .into_iter()
+        .filter(|s| {
+            matches!(
+                s.action.as_str(),
+                "SCMP_ACT_ERRNO" | "SCMP_ACT_KILL" | "SCMP_ACT_KILL_THREAD" | "SCMP_ACT_KILL_PROCESS"
+            )
+        })
+        .flat_map(|s| s.names)
+        .collect();
+    Ok(deny)
+}
+
 #[derive(Debug, Clone)]
 pub struct CriRuntimeOptions {
     pub default_agent_image: String,
@@ -829,21 +877,38 @@ impl RuntimeService for BoxRuntimeService {
             }
             // CRI seccomp: RuntimeDefault installs the default BPF filter in the
             // guest (Seccomp: 2); Unconfined / unset leave the container
-            // unconfined. Localhost profiles are not yet plumbed into the VM.
-            if let Some(profile) = sc.seccomp.as_ref() {
+            // unconfined; Localhost compiles the profile's deny list. Privileged
+            // containers bypass seccomp entirely — a requested profile is
+            // ignored when privileged (per the CRI contract).
+            if let Some(profile) = sc.seccomp.as_ref().filter(|_| !sc.privileged) {
                 use crate::cri_api::security_profile::ProfileType;
                 match profile.profile_type() {
                     ProfileType::RuntimeDefault => {
                         env.push(("A3S_SEC_SECCOMP".to_string(), "default".to_string()));
                     }
                     ProfileType::Localhost => {
-                        // Not yet plumbed into the VM — warn rather than
-                        // silently downgrading to unconfined.
-                        tracing::warn!(
-                            container = %metadata.name,
-                            profile = %profile.localhost_ref,
-                            "Localhost seccomp profiles are not yet supported; container runs without the requested profile"
-                        );
+                        // Read + parse the localhost profile (allow-default +
+                        // ERRNO deny list) and pass the blocked syscalls to the
+                        // guest, which compiles them into a BPF filter.
+                        match parse_localhost_seccomp_deny(&profile.localhost_ref) {
+                            Ok(deny) => {
+                                env.push((
+                                    "A3S_SEC_SECCOMP_LOCALHOST".to_string(),
+                                    deny.join(","),
+                                ));
+                            }
+                            Err(e) => {
+                                // Fall back to RuntimeDefault rather than running
+                                // unconfined when the profile can't be applied.
+                                tracing::warn!(
+                                    container = %metadata.name,
+                                    profile = %profile.localhost_ref,
+                                    error = %e,
+                                    "Localhost seccomp profile unsupported; applying RuntimeDefault instead"
+                                );
+                                env.push(("A3S_SEC_SECCOMP".to_string(), "default".to_string()));
+                            }
+                        }
                     }
                     ProfileType::Unconfined => {}
                 }
