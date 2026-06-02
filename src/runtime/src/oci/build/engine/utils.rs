@@ -172,7 +172,24 @@ pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
-        if src_path.is_dir() {
+        // Use the no-follow file type so a symlink is preserved as a symlink
+        // (Docker copies symlinks verbatim; following them would duplicate the
+        // target content and lose e.g. shared-library `.so -> .so.1` links).
+        let file_type = entry
+            .file_type()
+            .map_err(|e| BoxError::BuildError(format!("Failed to stat entry: {}", e)))?;
+
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&src_path).map_err(|e| {
+                BoxError::BuildError(format!(
+                    "Failed to read symlink {}: {}",
+                    src_path.display(),
+                    e
+                ))
+            })?;
+            let _ = std::fs::remove_file(&dst_path);
+            symlink_to(&target, &dst_path)?;
+        } else if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             std::fs::copy(&src_path, &dst_path).map_err(|e| {
@@ -186,6 +203,22 @@ pub(super) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Create a symlink at `link` pointing at `target` (best-effort cross-platform).
+fn symlink_to(target: &Path, link: &Path) -> Result<()> {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(not(unix))]
+    let result = std::fs::write(link, Vec::new()); // non-unix fallback: placeholder file
+    result.map_err(|e| {
+        BoxError::BuildError(format!(
+            "Failed to create symlink {} -> {}: {}",
+            link.display(),
+            target.display(),
+            e
+        ))
+    })
 }
 
 /// Format a byte size as a human-readable string.

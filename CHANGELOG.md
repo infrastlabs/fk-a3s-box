@@ -70,6 +70,11 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- `COPY`/`ADD` now preserve symlinks instead of following them: a copied symlink
+  (e.g. a shared library `libfoo.so -> libfoo.so.1`, or any `node_modules`/
+  `/usr/lib` link) was dereferenced into a duplicate regular file, losing the
+  link and bloating the image. Symlinks (including symlink-to-dir and dangling
+  links) are now stored as symlink layer entries, matching Docker.
 - Multi-stage `COPY --from=<stage> /abs/path` (and any absolute COPY/ADD source)
   was broken: the absolute source was resolved against the host root instead of
   the source stage's rootfs (`Path::join` discards the base for an absolute

@@ -148,14 +148,19 @@ pub fn create_layer(
 
     let encoder = GzEncoder::new(file, Compression::default());
     let mut builder = tar::Builder::new(encoder);
+    // Preserve symlinks (e.g. created by `RUN ln -s`) as symlink entries.
+    builder.follow_symlinks(false);
 
     for relative_path in changed_files {
         let full_path = rootfs.join(relative_path);
-        if !full_path.exists() {
-            continue;
-        }
+        // No-follow stat: captures symlinks (incl. dangling ones) without
+        // following, so a symlink is added as a symlink, not its target.
+        let meta = match std::fs::symlink_metadata(&full_path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
 
-        if full_path.is_dir() {
+        if meta.is_dir() {
             builder.append_dir(relative_path, &full_path).map_err(|e| {
                 BoxError::BuildError(format!(
                     "Failed to add directory {} to layer: {}",
@@ -222,6 +227,8 @@ pub fn create_layer_from_dir(
 
     let encoder = GzEncoder::new(file, Compression::default());
     let mut builder = tar::Builder::new(encoder);
+    // Preserve symlinks as symlink entries instead of copying their targets.
+    builder.follow_symlinks(false);
 
     add_dir_to_tar(&mut builder, src_dir, src_dir, target_prefix)?;
 
@@ -269,7 +276,13 @@ fn add_dir_to_tar<W: std::io::Write>(
             .map_err(|e| BoxError::BuildError(format!("Failed to strip prefix: {}", e)))?;
         let tar_path = target_prefix.join(relative);
 
-        if path.is_dir() {
+        // No-follow type check: a symlink (even one pointing at a directory)
+        // must be added as a symlink entry, not recursed into.
+        let file_type = entry
+            .file_type()
+            .map_err(|e| BoxError::BuildError(format!("Failed to stat entry: {}", e)))?;
+
+        if file_type.is_dir() {
             builder.append_dir(&tar_path, &path).map_err(|e| {
                 BoxError::BuildError(format!("Failed to add directory to layer: {}", e))
             })?;
@@ -529,6 +542,37 @@ mod tests {
 
         assert!(paths.iter().any(|p| p.contains("workspace/app.py")));
         assert!(paths.iter().any(|p| p.contains("workspace/lib")));
+    }
+
+    /// Regression: symlinks must be stored as symlink entries (Docker copies
+    /// them verbatim), not followed into a duplicate of their target.
+    #[test]
+    #[cfg(unix)]
+    fn test_create_layer_from_dir_preserves_symlinks() {
+        let src = TempDir::new().unwrap();
+        let output_dir = TempDir::new().unwrap();
+        fs::write(src.path().join("libfoo.so.1"), "real").unwrap();
+        std::os::unix::fs::symlink("libfoo.so.1", src.path().join("libfoo.so")).unwrap();
+
+        let out = output_dir.path().join("layer.tar.gz");
+        create_layer_from_dir(src.path(), Path::new("lib"), &out).unwrap();
+
+        let file = fs::File::open(&out).unwrap();
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let mut found_symlink = false;
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().unwrap().to_string_lossy() == "lib/libfoo.so" {
+                assert_eq!(entry.header().entry_type(), tar::EntryType::Symlink);
+                assert_eq!(
+                    entry.link_name().unwrap().unwrap().to_string_lossy(),
+                    "libfoo.so.1"
+                );
+                found_symlink = true;
+            }
+        }
+        assert!(found_symlink, "symlink entry must be present in the layer");
     }
 
     // --- sha256 ---
