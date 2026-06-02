@@ -10,6 +10,7 @@ use std::sync::Arc;
 use a3s_box_core::error::{BoxError, Result};
 use a3s_box_core::platform::Platform;
 
+use super::cache::{hash_context_sources, BuildCache};
 use super::dockerfile::{Dockerfile, Instruction};
 use super::layer::{sha256_bytes, sha256_file, LayerInfo};
 use crate::oci::image::OciImageConfig;
@@ -190,9 +191,51 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
         let mut base_layers: Vec<LayerInfo> = Vec::new();
         let mut base_diff_ids: Vec<String> = Vec::new();
 
+        // Layer-level build cache (best-effort; None disables caching).
+        let cache = BuildCache::open();
+        // Running chain key over all instructions in this stage. Reset at FROM.
+        let mut chain_key = String::new();
+        // Once a cache miss forces re-execution, all later layers must be rebuilt.
+        let mut cache_valid = true;
+
         for instruction in &stage.instructions {
             global_step += 1;
             let step = global_step;
+
+            // Advance the chain key BEFORE the match so a cache-hit `continue`
+            // does not skip it. FROM resets the key (keyed on base content below);
+            // every other instruction extends it, including config-only ones
+            // (ENV/WORKDIR/...) since they affect later RUNs.
+            if !matches!(instruction, Instruction::From { .. }) {
+                // Use build-arg-expanded text in the cache key for instructions
+                // whose effect depends on ARG/--build-arg values, so a different
+                // build arg correctly invalidates downstream layers. (RUN/COPY
+                // paths are not arg-expanded by this engine, so their raw repr is
+                // faithful; build-arg-driven behavior reaches RUN only via ENV.)
+                let repr = match instruction {
+                    Instruction::Env { key, value } => {
+                        format!("ENV {}={}", key, expand_args(value, &state.build_args))
+                    }
+                    Instruction::Arg { name, default } => {
+                        let effective = state
+                            .build_args
+                            .get(name)
+                            .cloned()
+                            .or_else(|| default.clone())
+                            .unwrap_or_default();
+                        format!("ARG {}={}", name, effective)
+                    }
+                    other => instruction_to_string(other),
+                };
+                let input_hash = match instruction {
+                    Instruction::Copy { src, from, .. } if from.is_none() => {
+                        hash_context_sources(&config.context_dir, src)
+                    }
+                    Instruction::Add { src, .. } => hash_context_sources(&config.context_dir, src),
+                    _ => None,
+                };
+                chain_key = BuildCache::chain(&chain_key, &repr, input_hash.as_deref());
+            }
 
             match instruction {
                 Instruction::From { image, alias } => {
@@ -219,6 +262,12 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                             .await?;
                     base_layers = layers;
                     base_diff_ids = diff_ids;
+
+                    // Key the cache chain on the actual base image content so a
+                    // different base invalidates everything that follows. FROM
+                    // itself is never cached.
+                    chain_key = sha256_bytes(base_diff_ids.join(",").as_bytes());
+                    cache_valid = true;
 
                     // Inherit config from base image
                     apply_base_config(&mut state, &base_config);
@@ -249,6 +298,31 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                 }
 
                 Instruction::Copy { src, dst, from } => {
+                    let created_by = if let Some(from_ref) = from {
+                        format!("COPY --from={} {} {}", from_ref, src.join(" "), dst)
+                    } else {
+                        format!("COPY {} {}", src.join(" "), dst)
+                    };
+                    if try_reuse_cached_layer(
+                        cache_valid,
+                        cache.as_ref(),
+                        &chain_key,
+                        &rootfs_dir,
+                        &mut state,
+                        &created_by,
+                    )?
+                    .is_some()
+                    {
+                        if !config.quiet {
+                            println!(
+                                "Step {}/{}: {} (CACHED)",
+                                step, total_instructions, created_by
+                            );
+                        }
+                        continue;
+                    }
+                    cache_valid = false;
+
                     if let Some(from_ref) = from {
                         if !config.quiet {
                             println!(
@@ -270,7 +344,11 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                             &state.workdir,
                             state.layers.len() + base_layers.len(),
                         )?;
-                        state.diff_ids.push(compute_diff_id(&layer_info.path)?);
+                        let diff_id = compute_diff_id(&layer_info.path)?;
+                        if let Some(c) = &cache {
+                            c.store(&chain_key, &layer_info, &diff_id);
+                        }
+                        state.diff_ids.push(diff_id);
                         state.layers.push(layer_info);
                         state.history.push(HistoryEntry {
                             created_by: format!(
@@ -300,7 +378,11 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                             &state.workdir,
                             state.layers.len() + base_layers.len(),
                         )?;
-                        state.diff_ids.push(compute_diff_id(&layer_info.path)?);
+                        let diff_id = compute_diff_id(&layer_info.path)?;
+                        if let Some(c) = &cache {
+                            c.store(&chain_key, &layer_info, &diff_id);
+                        }
+                        state.diff_ids.push(diff_id);
                         state.layers.push(layer_info);
                         state.history.push(HistoryEntry {
                             created_by: format!("COPY {} {}", src.join(" "), dst),
@@ -310,6 +392,27 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                 }
 
                 Instruction::Add { src, dst, chown } => {
+                    let created_by = format!("ADD {} {}", src.join(" "), dst);
+                    if try_reuse_cached_layer(
+                        cache_valid,
+                        cache.as_ref(),
+                        &chain_key,
+                        &rootfs_dir,
+                        &mut state,
+                        &created_by,
+                    )?
+                    .is_some()
+                    {
+                        if !config.quiet {
+                            println!(
+                                "Step {}/{}: {} (CACHED)",
+                                step, total_instructions, created_by
+                            );
+                        }
+                        continue;
+                    }
+                    cache_valid = false;
+
                     if !config.quiet {
                         println!(
                             "Step {}/{}: ADD {} {}",
@@ -329,7 +432,11 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                         &state.workdir,
                         state.layers.len() + base_layers.len(),
                     )?;
-                    state.diff_ids.push(compute_diff_id(&layer_info.path)?);
+                    let diff_id = compute_diff_id(&layer_info.path)?;
+                    if let Some(c) = &cache {
+                        c.store(&chain_key, &layer_info, &diff_id);
+                    }
+                    state.diff_ids.push(diff_id);
                     state.layers.push(layer_info);
                     state.history.push(HistoryEntry {
                         created_by: format!("ADD {} {}", src.join(" "), dst),
@@ -338,6 +445,27 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                 }
 
                 Instruction::Run { command } => {
+                    let created_by = format!("RUN {}", command);
+                    if try_reuse_cached_layer(
+                        cache_valid,
+                        cache.as_ref(),
+                        &chain_key,
+                        &rootfs_dir,
+                        &mut state,
+                        &created_by,
+                    )?
+                    .is_some()
+                    {
+                        if !config.quiet {
+                            println!(
+                                "Step {}/{}: {} (CACHED)",
+                                step, total_instructions, created_by
+                            );
+                        }
+                        continue;
+                    }
+                    cache_valid = false;
+
                     if !config.quiet {
                         println!("Step {}/{}: RUN {}", step, total_instructions, command);
                     }
@@ -352,7 +480,11 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                         config.quiet,
                     )?;
                     if let Some(layer_info) = layer_opt {
-                        state.diff_ids.push(compute_diff_id(&layer_info.path)?);
+                        let diff_id = compute_diff_id(&layer_info.path)?;
+                        if let Some(c) = &cache {
+                            c.store(&chain_key, &layer_info, &diff_id);
+                        }
+                        state.diff_ids.push(diff_id);
                         state.layers.push(layer_info);
                         state.history.push(HistoryEntry {
                             created_by: format!("RUN {}", command),
@@ -628,6 +760,44 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
 // =============================================================================
 // Helper functions
 // =============================================================================
+
+/// Attempt to reuse a cached layer for a layer-producing instruction.
+///
+/// On a cache hit (and only when `cache_valid` is still true and a cache is
+/// open), this applies the cached layer's diff to `rootfs_dir` so later
+/// instructions build on the correct rootfs, then records the layer, diff_id,
+/// and a non-empty history entry in `state`. Returns `Some(())` on a hit (the
+/// caller should `continue`), or `None` to fall through to normal execution.
+fn try_reuse_cached_layer(
+    cache_valid: bool,
+    cache: Option<&BuildCache>,
+    chain_key: &str,
+    rootfs_dir: &Path,
+    state: &mut BuildState,
+    created_by: &str,
+) -> Result<Option<()>> {
+    if !cache_valid {
+        return Ok(None);
+    }
+    let Some(cached) = cache.and_then(|c| c.lookup(chain_key)) else {
+        return Ok(None);
+    };
+
+    // Apply the cached diff so subsequent instructions see the right rootfs.
+    extract_layer(&cached.blob_path, rootfs_dir)?;
+
+    state.layers.push(LayerInfo {
+        path: cached.blob_path,
+        digest: cached.digest,
+        size: cached.size,
+    });
+    state.diff_ids.push(cached.diff_id);
+    state.history.push(HistoryEntry {
+        created_by: created_by.to_string(),
+        empty_layer: false,
+    });
+    Ok(Some(()))
+}
 
 /// Handle FROM: pull base image and extract layers into rootfs.
 ///

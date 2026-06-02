@@ -18,6 +18,7 @@
 //! Unsupported Dockerfile flags and instructions fail with contextual errors
 //! instead of being silently ignored.
 
+pub(crate) mod cache;
 pub mod dockerfile;
 pub mod engine;
 pub mod layer;
