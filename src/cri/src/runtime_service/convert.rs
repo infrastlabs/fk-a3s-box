@@ -88,13 +88,18 @@ pub(super) fn container_mount_to_cri(mount: &ContainerMount) -> Mount {
 /// Reject CRI namespace options that a microVM-per-pod runtime cannot honor.
 ///
 /// Each pod is an isolated microVM with its own kernel and namespaces, so it
-/// cannot share the *host's* network/PID/IPC/user namespace
-/// (`NamespaceMode::NODE` — i.e. HostNetwork / HostPID / HostIpc). Rather than
-/// silently running such a pod fully isolated (the wrong semantics, and a
-/// fail-open surprise for the workload), reject it with a clear error, matching
-/// the fail-closed handling of unsupported mount propagation above.
-/// `POD`/`CONTAINER`/`TARGET` are accepted — all containers in a pod share the
-/// single VM-wide namespace set.
+/// cannot share the *host's* network/IPC/user namespace (`NamespaceMode::NODE`
+/// — i.e. HostNetwork / HostIpc): there is no host network or IPC namespace
+/// inside the guest. Rather than silently running such a pod fully isolated
+/// (the wrong semantics, and a fail-open surprise for the workload), reject it
+/// with a clear error, matching the fail-closed handling of unsupported mount
+/// propagation above.
+///
+/// `HostPID` (`pid == NODE`) is NOT rejected: all of a pod's processes already
+/// share the single VM-wide PID namespace (incl. the VM's PID 1), which is the
+/// broadest PID namespace available in the guest — there is no separate host
+/// PID namespace to be denied, so HostPID is legitimately satisfied. `POD`/
+/// `CONTAINER`/`TARGET` are likewise accepted (one shared VM namespace set).
 pub(super) fn validate_namespace_options(
     options: Option<&NamespaceOption>,
     context: &str,
@@ -105,7 +110,6 @@ pub(super) fn validate_namespace_options(
     let host = crate::cri_api::namespace_option::NamespaceMode::Node as i32;
     for (mode, kind) in [
         (options.network, "network (HostNetwork)"),
-        (options.pid, "PID (HostPID)"),
         (options.ipc, "IPC (HostIpc)"),
         (options.user, "user"),
     ] {
@@ -455,10 +459,20 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_namespace_options_rejects_host_namespaces() {
+    fn test_validate_namespace_options_accepts_host_pid() {
+        // HostPID is satisfied by the pod's shared VM-wide PID namespace — must
+        // NOT be rejected (regression guard for "runtime should support HostPID").
+        assert!(validate_namespace_options(
+            Some(&ns(NamespaceMode::Pod, NamespaceMode::Node, NamespaceMode::Pod)),
+            "X"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_namespace_options_rejects_host_network_and_ipc() {
         for opts in [
             ns(NamespaceMode::Node, NamespaceMode::Container, NamespaceMode::Pod), // HostNetwork
-            ns(NamespaceMode::Pod, NamespaceMode::Node, NamespaceMode::Pod),       // HostPID
             ns(NamespaceMode::Pod, NamespaceMode::Container, NamespaceMode::Node), // HostIpc
         ] {
             let err = validate_namespace_options(Some(&opts), "RunPodSandbox").unwrap_err();
