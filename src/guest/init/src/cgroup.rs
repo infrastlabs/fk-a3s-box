@@ -1,11 +1,13 @@
-//! Per-container memory cgroup (cgroup v2) for OOM accounting.
+//! Per-container cgroup v2 (memory + cpu limits) for the guest.
 //!
-//! The CRI `LinuxContainerResources.memory_limit_in_bytes` is enforced inside
-//! the guest by placing the container process in its own cgroup v2 memory
-//! cgroup with `memory.max` set to the limit. When the workload (or the page
-//! cache / tmpfs it touches) exceeds the limit, the kernel OOM-killer reaps the
-//! cgroup; `memory.events`'s `oom_kill` counter then lets us report the
-//! container exit reason as `OOMKilled` — matching how runc/containerd behave.
+//! The CRI `LinuxContainerResources` limits are enforced inside the guest by
+//! placing the container — and, crucially, every process it forks — in its own
+//! cgroup v2 with `memory.max` and/or `cpu.max` set. The container joins the
+//! cgroup from its pre-exec hook (writing its own PID to `cgroup.procs` before
+//! exec), so workers it forks immediately cannot escape the limit. When memory
+//! is exceeded the kernel OOM-killer reaps the cgroup; `memory.events`'s
+//! `oom_kill` counter then lets us report the exit reason as `OOMKilled`,
+//! matching runc/containerd.
 //!
 //! This is Linux-only and entirely best-effort: any failure (cgroup v2 absent,
 //! permission denied, controller unavailable) degrades to "no enforcement, no
@@ -21,9 +23,10 @@ use tracing::{debug, warn};
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 static CGROUP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Ensure cgroup v2 is mounted at `/sys/fs/cgroup` with the `memory` controller
-/// delegated to child cgroups. Idempotent; returns `false` if cgroup v2 (with a
-/// usable memory controller) could not be made available.
+/// Ensure cgroup v2 is mounted at `/sys/fs/cgroup` with the `memory` and `cpu`
+/// controllers delegated to child cgroups. Idempotent; returns `false` if
+/// cgroup v2 could not be made available (`memory` is required, `cpu`
+/// best-effort).
 fn ensure_cgroup2_ready() -> bool {
     let controllers_path = format!("{CGROUP_ROOT}/cgroup.controllers");
     if std::fs::metadata(&controllers_path).is_err() {
@@ -42,31 +45,33 @@ fn ensure_cgroup2_ready() -> bool {
         }
     }
 
-    // The memory controller must be listed as available and delegated to
-    // children via the root's subtree_control (the root cgroup is exempt from
-    // the no-internal-processes rule, so enabling it here is allowed).
-    match std::fs::read_to_string(&controllers_path) {
-        Ok(controllers) if controllers.split_whitespace().any(|c| c == "memory") => {
-            let subtree = format!("{CGROUP_ROOT}/cgroup.subtree_control");
-            if let Ok(current) = std::fs::read_to_string(&subtree) {
-                if !current.split_whitespace().any(|c| c == "memory") {
-                    if let Err(error) = write_cgroup_file(&subtree, "+memory") {
-                        warn!(error = %error, "cgroup: failed to delegate memory controller");
-                        return false;
-                    }
-                }
-            }
-            true
-        }
-        Ok(_) => {
-            warn!("cgroup: memory controller not available in cgroup.controllers");
-            false
-        }
+    let available = match std::fs::read_to_string(&controllers_path) {
+        Ok(controllers) => controllers,
         Err(error) => {
             warn!(error = %error, "cgroup: cannot read cgroup.controllers");
-            false
+            return false;
+        }
+    };
+    let has = |ctrl: &str| available.split_whitespace().any(|c| c == ctrl);
+
+    // Delegate controllers to child cgroups via the root's subtree_control (the
+    // root cgroup is exempt from the no-internal-processes rule). memory is
+    // required (limits + OOM accounting); cpu is best-effort (cpu.max throttle).
+    let subtree = format!("{CGROUP_ROOT}/cgroup.subtree_control");
+    let current = std::fs::read_to_string(&subtree).unwrap_or_default();
+    for ctrl in ["memory", "cpu"] {
+        if has(ctrl) && !current.split_whitespace().any(|c| c == ctrl) {
+            if let Err(error) = write_cgroup_file(&subtree, &format!("+{ctrl}")) {
+                warn!(error = %error, ctrl, "cgroup: failed to delegate controller");
+            }
         }
     }
+
+    if !has("memory") {
+        warn!("cgroup: memory controller not available in cgroup.controllers");
+        return false;
+    }
+    true
 }
 
 fn write_cgroup_file(path: &str, value: &str) -> std::io::Result<()> {
@@ -74,46 +79,70 @@ fn write_cgroup_file(path: &str, value: &str) -> std::io::Result<()> {
     file.write_all(value.as_bytes())
 }
 
-/// A per-container memory cgroup. Dropping it removes the cgroup directory.
-pub struct MemoryCgroup {
+/// A per-container cgroup v2 (memory + cpu limits). Dropping it removes the
+/// cgroup directory.
+pub struct ContainerCgroup {
     path: String,
 }
 
-impl MemoryCgroup {
-    /// Create a memory cgroup with `memory.max = limit_bytes`. Returns `None`
-    /// when cgroup v2 / the memory controller is unavailable, in which case the
-    /// caller proceeds without enforcement (and without OOM detection).
-    pub fn create(limit_bytes: u64) -> Option<Self> {
-        if limit_bytes == 0 || !ensure_cgroup2_ready() {
+impl ContainerCgroup {
+    /// Create a per-container cgroup applying the given limits: `memory.max`
+    /// (bytes) and/or `cpu.max` (`cpu_quota` µs per `cpu_period` µs). Returns
+    /// `None` when no limit is requested or cgroup v2 is unavailable, in which
+    /// case the caller proceeds without enforcement.
+    pub fn create(
+        memory_max: Option<u64>,
+        cpu_quota: Option<i64>,
+        cpu_period: Option<u64>,
+    ) -> Option<Self> {
+        let want_memory = memory_max.is_some_and(|m| m > 0);
+        let want_cpu = cpu_quota.is_some_and(|q| q > 0);
+        if (!want_memory && !want_cpu) || !ensure_cgroup2_ready() {
             return None;
         }
         let seq = CGROUP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = format!("{CGROUP_ROOT}/box-mem-{}-{}", std::process::id(), seq);
+        let path = format!("{CGROUP_ROOT}/box-{}-{}", std::process::id(), seq);
         if let Err(error) = std::fs::create_dir(&path) {
-            warn!(error = %error, path, "cgroup: failed to create memory cgroup");
+            warn!(error = %error, path, "cgroup: failed to create container cgroup");
             return None;
         }
-        if let Err(error) =
-            write_cgroup_file(&format!("{path}/memory.max"), &limit_bytes.to_string())
-        {
-            warn!(error = %error, "cgroup: failed to set memory.max");
-            let _ = std::fs::remove_dir(&path);
-            return None;
+        if want_memory {
+            let limit = memory_max.unwrap_or(0);
+            if let Err(error) = write_cgroup_file(&format!("{path}/memory.max"), &limit.to_string())
+            {
+                warn!(error = %error, "cgroup: failed to set memory.max");
+                let _ = std::fs::remove_dir(&path);
+                return None;
+            }
+            // Kill the whole cgroup on OOM so the container's main process dies
+            // even if the over-allocating process was a child (best-effort).
+            let _ = write_cgroup_file(&format!("{path}/memory.oom.group"), "1");
         }
-        // Kill the whole cgroup on OOM so the container's main process dies even
-        // if the over-allocating process was a child (best-effort).
-        let _ = write_cgroup_file(&format!("{path}/memory.oom.group"), "1");
-        debug!(path, limit_bytes, "cgroup: created memory cgroup");
+        if want_cpu {
+            // cgroup v2 `cpu.max` = "<quota_us> <period_us>"; CRI defaults the
+            // period to 100ms when unset.
+            let period = cpu_period.filter(|p| *p > 0).unwrap_or(100_000);
+            let value = format!("{} {}", cpu_quota.unwrap_or(0), period);
+            // Non-fatal: keep the cgroup so any memory limit still applies.
+            if let Err(error) = write_cgroup_file(&format!("{path}/cpu.max"), &value) {
+                warn!(error = %error, value, "cgroup: failed to set cpu.max");
+            }
+        }
+        debug!(
+            path,
+            ?memory_max,
+            ?cpu_quota,
+            "cgroup: created container cgroup"
+        );
         Some(Self { path })
     }
 
-    /// Move a process into this cgroup.
-    pub fn add_pid(&self, pid: u32) {
-        if let Err(error) =
-            write_cgroup_file(&format!("{}/cgroup.procs", self.path), &pid.to_string())
-        {
-            warn!(error = %error, pid, "cgroup: failed to add process to memory cgroup");
-        }
+    /// Path to this cgroup's `cgroup.procs` (where a process writes its own PID
+    /// to join). Used by the pre-exec hook so the container — and every process
+    /// it forks — is in the cgroup from birth (a parent-side join after spawn
+    /// races with workers the container forks immediately).
+    pub fn procs_path(&self) -> String {
+        format!("{}/cgroup.procs", self.path)
     }
 
     /// Number of OOM kills recorded in this cgroup (`memory.events` `oom_kill`).
@@ -131,7 +160,7 @@ impl MemoryCgroup {
     }
 }
 
-impl Drop for MemoryCgroup {
+impl Drop for ContainerCgroup {
     fn drop(&mut self) {
         // Safe only once the cgroup is empty (the container has been reaped).
         if let Err(error) = std::fs::remove_dir(&self.path) {

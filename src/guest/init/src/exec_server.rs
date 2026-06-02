@@ -348,6 +348,7 @@ struct ExecCommandSpec<'a> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn build_command(
     spec: ExecCommandSpec<'_>,
+    cgroup_procs: Option<&str>,
 ) -> Result<(std::process::Command, Duration), ExecOutput> {
     if spec.cmd.is_empty() {
         return Err(ExecOutput {
@@ -575,6 +576,7 @@ fn build_command(
         cap_keep,
         seccomp_localhost,
         no_new_privs,
+        cgroup_procs,
     );
     if spec.rootfs.is_none() {
         if let Some(dir) = spec.working_dir {
@@ -622,16 +624,19 @@ fn execute_command(
     stdin_data: Option<&[u8]>,
     user: Option<&str>,
 ) -> ExecOutput {
-    let (mut command, timeout) = match build_command(ExecCommandSpec {
-        cmd,
-        timeout_ns,
-        env,
-        working_dir,
-        rootfs,
-        stdin_data,
-        stdin_streaming: false,
-        user,
-    }) {
+    let (mut command, timeout) = match build_command(
+        ExecCommandSpec {
+            cmd,
+            timeout_ns,
+            env,
+            working_dir,
+            rootfs,
+            stdin_data,
+            stdin_streaming: false,
+            user,
+        },
+        None,
+    ) {
         Ok(command) => command,
         Err(output) => return output,
     };
@@ -852,19 +857,29 @@ fn execute_command_streaming(
     input_rx: Option<mpsc::Receiver<ExecInputEvent>>,
     writer: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut command, timeout) = match build_command(spec) {
+    // Per-container cgroup v2 (memory.max / cpu.max) for resource limits + OOM
+    // accounting. Created BEFORE build_command so its cgroup.procs path can be
+    // handed to the pre-exec hook: the container joins the cgroup itself (before
+    // exec), so every worker it forks is bounded too — a parent-side join after
+    // spawn races with workers the container forks immediately.
+    #[cfg(target_os = "linux")]
+    let container_cgroup = crate::cgroup::ContainerCgroup::create(
+        parse_sec_mem_limit(spec.env),
+        parse_sec_int(spec.env, "A3S_SEC_CPU_QUOTA="),
+        parse_sec_int(spec.env, "A3S_SEC_CPU_PERIOD=").map(|value| value as u64),
+    );
+    #[cfg(target_os = "linux")]
+    let cgroup_procs = container_cgroup.as_ref().map(|cgroup| cgroup.procs_path());
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_procs: Option<String> = None;
+
+    let (mut command, timeout) = match build_command(spec, cgroup_procs.as_deref()) {
         Ok(command) => command,
         Err(output) => {
             write_exec_stream_response(writer, &output)?;
             return Ok(());
         }
     };
-
-    // Per-container memory cgroup (cgroup v2) for OOM accounting. Created before
-    // spawn so the child can be placed in it immediately; the workload's memory
-    // (incl. tmpfs / page cache it touches) is then bounded by `memory.max`.
-    #[cfg(target_os = "linux")]
-    let mem_cgroup = parse_sec_mem_limit(spec.env).and_then(crate::cgroup::MemoryCgroup::create);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -878,11 +893,6 @@ fn execute_command_streaming(
             return Ok(());
         }
     };
-
-    #[cfg(target_os = "linux")]
-    if let Some(cgroup) = mem_cgroup.as_ref() {
-        cgroup.add_pid(child.id());
-    }
 
     write_child_stdin(&mut child, spec.stdin_data, spec.stdin_streaming);
 
@@ -943,7 +953,7 @@ fn execute_command_streaming(
     // A non-zero cgroup `oom_kill` count means the kernel OOM-killer reaped the
     // container for exceeding its memory limit — report it as OOMKilled.
     #[cfg(target_os = "linux")]
-    let oom_killed = mem_cgroup
+    let oom_killed = container_cgroup
         .as_ref()
         .is_some_and(|cgroup| cgroup.oom_kills() > 0);
     #[cfg(not(target_os = "linux"))]
@@ -964,12 +974,17 @@ fn configure_child_process(
     cap_keep: Option<Vec<String>>,
     seccomp_localhost: Vec<String>,
     no_new_privs: bool,
+    cgroup_procs: Option<&str>,
 ) {
     use std::ffi::CString;
     use std::os::unix::process::CommandExt;
 
     let rootfs = rootfs
         .map(|rootfs| CString::new(rootfs.as_bytes()).expect("rootfs path was pre-validated"));
+    // The per-container cgroup's `cgroup.procs` path; the child writes its own
+    // PID here (before chroot) so it — and everything it forks — is bounded by
+    // the cgroup's memory.max / cpu.max from birth. Built pre-fork (allocates).
+    let cgroup_procs = cgroup_procs.and_then(|path| CString::new(path.as_bytes()).ok());
     // workdir (for chdir) is only used when chrooting into a rootfs, where
     // build_command has already rejected an embedded NUL. Build the CString only
     // in that case so a workdir containing a NUL with no rootfs set cannot panic
@@ -1006,6 +1021,34 @@ fn configure_child_process(
 
     unsafe {
         command.pre_exec(move || {
+            // Join the per-container cgroup FIRST, before chroot (afterwards the
+            // guest /sys/fs/cgroup is unreachable). Best-effort and entirely
+            // async-signal-safe: open + getpid + a stack-only itoa + write +
+            // close, no allocation. A failure here leaves the container
+            // unbounded rather than failing its launch.
+            if let Some(procs) = cgroup_procs.as_ref() {
+                let fd = libc::open(procs.as_ptr(), libc::O_WRONLY);
+                if fd >= 0 {
+                    let mut buf = [0u8; 20];
+                    let mut i = buf.len();
+                    let mut n = libc::getpid() as u64;
+                    if n == 0 {
+                        i -= 1;
+                        buf[i] = b'0';
+                    }
+                    while n > 0 {
+                        i -= 1;
+                        buf[i] = b'0' + (n % 10) as u8;
+                        n /= 10;
+                    }
+                    let _ = libc::write(
+                        fd,
+                        buf[i..].as_ptr() as *const libc::c_void,
+                        (buf.len() - i) as libc::size_t,
+                    );
+                    let _ = libc::close(fd);
+                }
+            }
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1078,6 +1121,7 @@ fn configure_child_process(
     _cap_keep: Option<Vec<String>>,
     _seccomp_localhost: Vec<String>,
     _no_new_privs: bool,
+    _cgroup_procs: Option<&str>,
 ) {
 }
 
@@ -1173,6 +1217,15 @@ fn parse_sec_mem_limit(env: &[String]) -> Option<u64> {
         .find_map(|entry| entry.strip_prefix("A3S_SEC_MEM_LIMIT="))
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|limit| *limit > 0)
+}
+
+/// Parse a signed integer from an `A3S_SEC_*=<n>` env entry (the CPU
+/// `cpu_quota`/`cpu_period` cgroup limits). `None` when unset/unparseable.
+#[cfg(target_os = "linux")]
+fn parse_sec_int(env: &[String], prefix: &str) -> Option<i64> {
+    env.iter()
+        .find_map(|entry| entry.strip_prefix(prefix))
+        .and_then(|value| value.trim().parse::<i64>().ok())
 }
 
 /// Parse a `':'`-separated absolute-path list from an `A3S_SEC_*` env entry.
@@ -1502,16 +1555,19 @@ mod tests {
 
     #[test]
     fn test_build_command_rejects_named_user() {
-        let output = build_command(ExecCommandSpec {
-            cmd: &["id".to_string()],
-            timeout_ns: 0,
-            env: &[],
-            working_dir: None,
-            rootfs: None,
-            stdin_data: None,
-            stdin_streaming: false,
-            user: Some("node"),
-        })
+        let output = build_command(
+            ExecCommandSpec {
+                cmd: &["id".to_string()],
+                timeout_ns: 0,
+                env: &[],
+                working_dir: None,
+                rootfs: None,
+                stdin_data: None,
+                stdin_streaming: false,
+                user: Some("node"),
+            },
+            None,
+        )
         .unwrap_err();
 
         assert_eq!(output.exit_code, 1);
@@ -1520,16 +1576,19 @@ mod tests {
 
     #[test]
     fn test_build_command_keeps_original_program_with_numeric_user() {
-        let (command, _) = build_command(ExecCommandSpec {
-            cmd: &["echo".to_string(), "hello".to_string()],
-            timeout_ns: 0,
-            env: &[],
-            working_dir: None,
-            rootfs: None,
-            stdin_data: None,
-            stdin_streaming: false,
-            user: Some("1000:1000"),
-        })
+        let (command, _) = build_command(
+            ExecCommandSpec {
+                cmd: &["echo".to_string(), "hello".to_string()],
+                timeout_ns: 0,
+                env: &[],
+                working_dir: None,
+                rootfs: None,
+                stdin_data: None,
+                stdin_streaming: false,
+                user: Some("1000:1000"),
+            },
+            None,
+        )
         .unwrap();
 
         assert_eq!(command.get_program(), "echo");

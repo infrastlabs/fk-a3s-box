@@ -980,14 +980,31 @@ impl RuntimeService for BoxRuntimeService {
         // per-container cgroup v2 `memory.max` and reports OOMKilled when the
         // kernel OOM-killer reaps the cgroup. The microVM RAM stays larger than
         // this, so the cgroup limit (not the VM) is what bounds the workload.
-        if let Some(limit) = config
+        if let Some(resources) = config
             .linux
             .as_ref()
             .and_then(|linux| linux.resources.as_ref())
-            .map(|resources| resources.memory_limit_in_bytes)
-            .filter(|bytes| *bytes > 0)
         {
-            env.push(("A3S_SEC_MEM_LIMIT".to_string(), limit.to_string()));
+            if resources.memory_limit_in_bytes > 0 {
+                env.push((
+                    "A3S_SEC_MEM_LIMIT".to_string(),
+                    resources.memory_limit_in_bytes.to_string(),
+                ));
+            }
+            // CPU limit → guest cgroup v2 cpu.max ("<quota_us> <period_us>"). A
+            // quota of 0 / -1 means unlimited, so only plumb a positive quota.
+            if resources.cpu_quota > 0 {
+                env.push((
+                    "A3S_SEC_CPU_QUOTA".to_string(),
+                    resources.cpu_quota.to_string(),
+                ));
+                if resources.cpu_period > 0 {
+                    env.push((
+                        "A3S_SEC_CPU_PERIOD".to_string(),
+                        resources.cpu_period.to_string(),
+                    ));
+                }
+            }
         }
         let working_dir = if config.working_dir.is_empty() {
             image_config
