@@ -75,6 +75,12 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- Image references with a purely numeric tag and no registry (`redis:7`,
+  `node:18`, `postgres:16`, `ubuntu:24`) were mis-parsed: the numeric tag was
+  treated as a registry port and dropped, so the reference resolved to the
+  `:latest` tag instead. A colon with no `/` is always a tag (a bare
+  `registry:port` with no repository is not a valid reference), so numeric tags
+  now parse correctly — affecting pull, run, and `images` display.
 - `COPY`/`ADD` now preserve symlinks instead of following them: a copied symlink
   (e.g. a shared library `libfoo.so -> libfoo.so.1`, or any `node_modules`/
   `/usr/lib` link) was dereferenced into a duplicate regular file, losing the
