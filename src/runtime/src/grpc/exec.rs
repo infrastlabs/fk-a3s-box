@@ -648,7 +648,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            let exit = a3s_box_core::exec::ExecExit { exit_code: 17 };
+            let exit = a3s_box_core::exec::ExecExit {
+                exit_code: 17,
+                oom_killed: false,
+            };
             writer
                 .write_control(&serde_json::to_vec(&exit).unwrap())
                 .await
@@ -705,7 +708,10 @@ mod tests {
             assert_eq!(cancel.frame_type, a3s_transport::FrameType::Control);
             assert_eq!(cancel.payload, b"cancel");
 
-            let exit = a3s_box_core::exec::ExecExit { exit_code: 137 };
+            let exit = a3s_box_core::exec::ExecExit {
+                exit_code: 137,
+                oom_killed: false,
+            };
             writer
                 .write_control(&serde_json::to_vec(&exit).unwrap())
                 .await
@@ -766,7 +772,10 @@ mod tests {
             assert_eq!(close.frame_type, a3s_transport::FrameType::Control);
             assert_eq!(close.payload, EXEC_CONTROL_STDIN_CLOSE);
 
-            let exit = a3s_box_core::exec::ExecExit { exit_code: 0 };
+            let exit = a3s_box_core::exec::ExecExit {
+                exit_code: 0,
+                oom_killed: false,
+            };
             writer
                 .write_control(&serde_json::to_vec(&exit).unwrap())
                 .await

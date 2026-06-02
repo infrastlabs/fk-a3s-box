@@ -956,6 +956,19 @@ impl RuntimeService for BoxRuntimeService {
         // override the runtime's (escalating supplemental groups, unmasking
         // paths, or toggling seccomp). Only runtime-derived values may set them.
         env.retain(|(key, _)| !key.starts_with("A3S_SEC_"));
+        // Carry the container memory limit so guest-init enforces it with a
+        // per-container cgroup v2 `memory.max` and reports OOMKilled when the
+        // kernel OOM-killer reaps the cgroup. The microVM RAM stays larger than
+        // this, so the cgroup limit (not the VM) is what bounds the workload.
+        if let Some(limit) = config
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.resources.as_ref())
+            .map(|resources| resources.memory_limit_in_bytes)
+            .filter(|bytes| *bytes > 0)
+        {
+            env.push(("A3S_SEC_MEM_LIMIT".to_string(), limit.to_string()));
+        }
         let working_dir = if config.working_dir.is_empty() {
             image_config
                 .and_then(|image| image.working_dir.clone())
@@ -1193,6 +1206,7 @@ impl RuntimeService for BoxRuntimeService {
             started_at: 0,
             finished_at: 0,
             exit_code: 0,
+            oom_killed: false,
             labels: config.labels.clone(),
             annotations: config.annotations.clone(),
             log_path,
@@ -1462,7 +1476,7 @@ impl RuntimeService for BoxRuntimeService {
                     self.stop_container_vm(&container, req.timeout).await?;
                     let updated = self
                         .store
-                        .mark_container_exited_if_running(container_id, now_ns, 137)
+                        .mark_container_exited_if_running(container_id, now_ns, 137, false)
                         .await;
                     if updated {
                         self.emit_container_event(
@@ -1552,7 +1566,9 @@ impl RuntimeService for BoxRuntimeService {
             ContainerState::Exited => crate::cri_api::ContainerState::ContainerExited,
         };
         let (reason, message) = match container.state {
-            ContainerState::Exited => container_exit_reason(container.exit_code),
+            ContainerState::Exited => {
+                container_exit_reason(container.exit_code, container.oom_killed)
+            }
             ContainerState::Created | ContainerState::Running => ("", String::new()),
         };
         let info = if req.verbose {

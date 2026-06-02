@@ -1349,7 +1349,10 @@ mod tests {
                 .write_data(&serde_json::to_vec(&stdout).unwrap())
                 .await
                 .unwrap();
-            let exit = a3s_box_core::exec::ExecExit { exit_code: 0 };
+            let exit = a3s_box_core::exec::ExecExit {
+                exit_code: 0,
+                oom_killed: false,
+            };
             writer
                 .write_control(&serde_json::to_vec(&exit).unwrap())
                 .await
@@ -1533,7 +1536,10 @@ mod tests {
             .unwrap();
         attach_tx
             .send(a3s_box_core::exec::ExecEvent::Exit(
-                a3s_box_core::exec::ExecExit { exit_code: 0 },
+                a3s_box_core::exec::ExecExit {
+                    exit_code: 0,
+                    oom_killed: false,
+                },
             ))
             .unwrap();
 
@@ -1574,7 +1580,10 @@ mod tests {
             assert_eq!(close.frame_type, a3s_transport::FrameType::Control);
             stdin_seen_tx.send((stdin.payload, close.payload)).unwrap();
 
-            let exit = a3s_box_core::exec::ExecExit { exit_code: 0 };
+            let exit = a3s_box_core::exec::ExecExit {
+                exit_code: 0,
+                oom_killed: false,
+            };
             writer
                 .write_control(&serde_json::to_vec(&exit).unwrap())
                 .await
@@ -1648,7 +1657,10 @@ mod tests {
         assert_eq!(close_payload, b"stdin-close");
         attach_tx
             .send(a3s_box_core::exec::ExecEvent::Exit(
-                a3s_box_core::exec::ExecExit { exit_code: 0 },
+                a3s_box_core::exec::ExecExit {
+                    exit_code: 0,
+                    oom_killed: false,
+                },
             ))
             .unwrap();
 

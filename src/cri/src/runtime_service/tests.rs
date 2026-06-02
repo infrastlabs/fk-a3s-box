@@ -491,7 +491,10 @@ where
 
                     sleep(exit_delay).await;
 
-                    let exit = a3s_box_core::exec::ExecExit { exit_code };
+                    let exit = a3s_box_core::exec::ExecExit {
+                        exit_code,
+                        oom_killed: false,
+                    };
                     writer
                         .write_control(&serde_json::to_vec(&exit).unwrap())
                         .await
@@ -576,7 +579,10 @@ async fn spawn_multi_exec_stream_server(
 
                         sleep(exit_delay).await;
 
-                        let exit = a3s_box_core::exec::ExecExit { exit_code };
+                        let exit = a3s_box_core::exec::ExecExit {
+                            exit_code,
+                            oom_killed: false,
+                        };
                         writer
                             .write_control(&serde_json::to_vec(&exit).unwrap())
                             .await
@@ -681,7 +687,10 @@ async fn spawn_cancelable_exec_stream_server() -> Option<TestExecServer> {
                     assert_eq!(cancel.frame_type, a3s_transport::FrameType::Control);
                     assert_eq!(cancel.payload, b"cancel");
 
-                    let exit = a3s_box_core::exec::ExecExit { exit_code: 137 };
+                    let exit = a3s_box_core::exec::ExecExit {
+                        exit_code: 137,
+                        oom_killed: false,
+                    };
                     writer
                         .write_control(&serde_json::to_vec(&exit).unwrap())
                         .await
@@ -848,6 +857,7 @@ fn test_container(id: &str, sandbox_id: &str) -> Container {
         started_at: 0,
         finished_at: 0,
         exit_code: 0,
+        oom_killed: false,
         labels: HashMap::from([("app".to_string(), "test".to_string())]),
         annotations: HashMap::new(),
         log_path: String::new(),
@@ -3370,7 +3380,7 @@ async fn test_stop_pod_sandbox_uses_workload_stop_controls_for_running_container
         sleep(Duration::from_millis(25)).await;
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         store
-            .mark_container_exited_if_running("c-1", now_ns, 143)
+            .mark_container_exited_if_running("c-1", now_ns, 143, false)
             .await;
     });
 
@@ -3379,7 +3389,7 @@ async fn test_stop_pod_sandbox_uses_workload_stop_controls_for_running_container
         second_stop_rx.await.unwrap();
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         store
-            .mark_container_exited_if_running("c-2", now_ns, 144)
+            .mark_container_exited_if_running("c-2", now_ns, 144, false)
             .await;
     });
 

@@ -218,8 +218,13 @@ pub(super) fn resolve_command_and_args(
     (command, args)
 }
 
-pub(super) fn container_exit_reason(exit_code: i32) -> (&'static str, String) {
-    if exit_code == 0 {
+pub(super) fn container_exit_reason(exit_code: i32, oom_killed: bool) -> (&'static str, String) {
+    if oom_killed {
+        (
+            "OOMKilled",
+            format!("Container was killed by the out-of-memory killer (exit code {exit_code})"),
+        )
+    } else if exit_code == 0 {
         ("Completed", "Container exited successfully".to_string())
     } else {
         ("Error", format!("Container exited with code {exit_code}"))
@@ -437,6 +442,19 @@ mod tests {
     use crate::cri_api::namespace_option::NamespaceMode;
     use crate::cri_api::NamespaceOption;
 
+    #[test]
+    fn test_container_exit_reason_oom_killed_overrides_code() {
+        // OOMKilled wins regardless of exit code (the OOM killer SIGKILLs → 137).
+        let (reason, message) = container_exit_reason(137, true);
+        assert_eq!(reason, "OOMKilled");
+        assert!(message.contains("out-of-memory"));
+        // A zero exit code that was still an OOM is reported as OOMKilled.
+        assert_eq!(container_exit_reason(0, true).0, "OOMKilled");
+        // Non-OOM exits keep Completed / Error.
+        assert_eq!(container_exit_reason(0, false).0, "Completed");
+        assert_eq!(container_exit_reason(1, false).0, "Error");
+    }
+
     fn ns(network: NamespaceMode, pid: NamespaceMode, ipc: NamespaceMode) -> NamespaceOption {
         NamespaceOption {
             network: network as i32,
@@ -452,7 +470,11 @@ mod tests {
         assert!(validate_namespace_options(None, "X").is_ok());
         // POD/CONTAINER (the kubelet default for ordinary pods) are accepted.
         assert!(validate_namespace_options(
-            Some(&ns(NamespaceMode::Pod, NamespaceMode::Container, NamespaceMode::Pod)),
+            Some(&ns(
+                NamespaceMode::Pod,
+                NamespaceMode::Container,
+                NamespaceMode::Pod
+            )),
             "X"
         )
         .is_ok());
@@ -463,7 +485,11 @@ mod tests {
         // HostPID is satisfied by the pod's shared VM-wide PID namespace — must
         // NOT be rejected (regression guard for "runtime should support HostPID").
         assert!(validate_namespace_options(
-            Some(&ns(NamespaceMode::Pod, NamespaceMode::Node, NamespaceMode::Pod)),
+            Some(&ns(
+                NamespaceMode::Pod,
+                NamespaceMode::Node,
+                NamespaceMode::Pod
+            )),
             "X"
         )
         .is_ok());
@@ -472,8 +498,16 @@ mod tests {
     #[test]
     fn test_validate_namespace_options_rejects_host_network_and_ipc() {
         for opts in [
-            ns(NamespaceMode::Node, NamespaceMode::Container, NamespaceMode::Pod), // HostNetwork
-            ns(NamespaceMode::Pod, NamespaceMode::Container, NamespaceMode::Node), // HostIpc
+            ns(
+                NamespaceMode::Node,
+                NamespaceMode::Container,
+                NamespaceMode::Pod,
+            ), // HostNetwork
+            ns(
+                NamespaceMode::Pod,
+                NamespaceMode::Container,
+                NamespaceMode::Node,
+            ), // HostIpc
         ] {
             let err = validate_namespace_options(Some(&opts), "RunPodSandbox").unwrap_err();
             assert_eq!(err.code(), tonic::Code::Unimplemented);

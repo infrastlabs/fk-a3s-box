@@ -278,7 +278,7 @@ fn write_exec_stream_response(
 ) -> Result<(), Box<dyn std::error::Error>> {
     write_exec_stream_chunks(w, StreamType::Stdout, &output.stdout)?;
     write_exec_stream_chunks(w, StreamType::Stderr, &output.stderr)?;
-    write_exec_exit(w, output.exit_code)
+    write_exec_exit(w, output.exit_code, false)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -313,8 +313,15 @@ fn write_exec_stream_chunk(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn write_exec_exit(w: &mut impl Write, exit_code: i32) -> Result<(), Box<dyn std::error::Error>> {
-    let exit = ExecExit { exit_code };
+fn write_exec_exit(
+    w: &mut impl Write,
+    exit_code: i32,
+    oom_killed: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let exit = ExecExit {
+        exit_code,
+        oom_killed,
+    };
     let payload = serde_json::to_vec(&exit)?;
     write_frame(w, FrameType::Control as u8, &payload)?;
     Ok(())
@@ -853,6 +860,12 @@ fn execute_command_streaming(
         }
     };
 
+    // Per-container memory cgroup (cgroup v2) for OOM accounting. Created before
+    // spawn so the child can be placed in it immediately; the workload's memory
+    // (incl. tmpfs / page cache it touches) is then bounded by `memory.max`.
+    #[cfg(target_os = "linux")]
+    let mem_cgroup = parse_sec_mem_limit(spec.env).and_then(crate::cgroup::MemoryCgroup::create);
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -865,6 +878,11 @@ fn execute_command_streaming(
             return Ok(());
         }
     };
+
+    #[cfg(target_os = "linux")]
+    if let Some(cgroup) = mem_cgroup.as_ref() {
+        cgroup.add_pid(child.id());
+    }
 
     write_child_stdin(&mut child, spec.stdin_data, spec.stdin_streaming);
 
@@ -922,7 +940,15 @@ fn execute_command_streaming(
         None => {}
     }
 
-    write_exec_exit(writer, exit_code)
+    // A non-zero cgroup `oom_kill` count means the kernel OOM-killer reaped the
+    // container for exceeding its memory limit — report it as OOMKilled.
+    #[cfg(target_os = "linux")]
+    let oom_killed = mem_cgroup
+        .as_ref()
+        .is_some_and(|cgroup| cgroup.oom_kills() > 0);
+    #[cfg(not(target_os = "linux"))]
+    let oom_killed = false;
+    write_exec_exit(writer, exit_code, oom_killed)
 }
 
 #[cfg(unix)]
@@ -1137,6 +1163,16 @@ fn ensure_container_dev_nodes(rootfs: &str) {
             );
         }
     }
+}
+
+/// Parse the container memory limit (bytes) from `A3S_SEC_MEM_LIMIT=<n>`.
+/// Returns `None` when unset, zero, or unparseable (no cgroup enforcement).
+#[cfg(target_os = "linux")]
+fn parse_sec_mem_limit(env: &[String]) -> Option<u64> {
+    env.iter()
+        .find_map(|entry| entry.strip_prefix("A3S_SEC_MEM_LIMIT="))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|limit| *limit > 0)
 }
 
 /// Parse a `':'`-separated absolute-path list from an `A3S_SEC_*` env entry.

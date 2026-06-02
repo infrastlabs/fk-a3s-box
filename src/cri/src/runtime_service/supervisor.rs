@@ -88,6 +88,7 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
         // below re-creates it from log_path if it was never opened.
         let mut log_writer = log_writer;
         let mut exit_code = -1;
+        let mut oom_killed = false;
 
         loop {
             tokio::select! {
@@ -151,6 +152,7 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
                         }
                         Ok(Some(a3s_box_core::exec::ExecEvent::Exit(exit))) => {
                             exit_code = exit.exit_code;
+                            oom_killed = exit.oom_killed;
                             break;
                         }
                         Ok(None) => break,
@@ -191,12 +193,15 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
             exit_code = 255;
         }
         let _ = attach_tx.send(a3s_box_core::exec::ExecEvent::Exit(
-            a3s_box_core::exec::ExecExit { exit_code },
+            a3s_box_core::exec::ExecExit {
+                exit_code,
+                oom_killed,
+            },
         ));
 
         let finished_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let updated = store
-            .mark_container_exited_if_running(&container_id, finished_ns, exit_code)
+            .mark_container_exited_if_running(&container_id, finished_ns, exit_code, oom_killed)
             .await;
 
         if updated {

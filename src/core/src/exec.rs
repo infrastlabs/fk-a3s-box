@@ -96,6 +96,11 @@ pub struct ExecChunk {
 pub struct ExecExit {
     /// Process exit code.
     pub exit_code: i32,
+    /// Set when the process (or its memory cgroup) was killed by the
+    /// out-of-memory killer. Carried back so the CRI can report the container
+    /// exit reason as `OOMKilled`. Defaults to `false` for wire compatibility.
+    #[serde(default)]
+    pub oom_killed: bool,
 }
 
 /// A streaming exec event — either a chunk of output or the final exit.
@@ -404,7 +409,10 @@ mod tests {
 
     #[test]
     fn test_exec_exit_serde_roundtrip() {
-        let exit = ExecExit { exit_code: 42 };
+        let exit = ExecExit {
+            exit_code: 42,
+            oom_killed: false,
+        };
         let json = serde_json::to_string(&exit).unwrap();
         let parsed: ExecExit = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.exit_code, 42);

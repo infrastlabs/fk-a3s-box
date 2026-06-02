@@ -139,6 +139,7 @@ mod tests {
             started_at: 2_000_000_000,
             finished_at: 0,
             exit_code: 0,
+            oom_killed: false,
             labels: HashMap::new(),
             annotations: HashMap::new(),
             log_path: String::new(),
