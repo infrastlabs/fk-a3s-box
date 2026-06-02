@@ -45,6 +45,14 @@ All notable changes to A3S Box will be documented in this file.
   drop before exec.
 
 ### Added
+- Pod port reachability: a port mapping with only a container port now publishes
+  it on the same host port (Docker/containerd style), and a default (TSI) pod
+  that publishes ports reports `127.0.0.1` as its pod IP — TSI binds
+  `0.0.0.0:<port>` and forwards to the guest, so `podIP:<containerPort>` is
+  genuinely reachable from the node. Passes the port-mapping and
+  multi-container networking conformance specs. (Single-node reachability via
+  the node loopback; not a unique cluster-routable pod IP, and concurrent pods
+  publishing the same port still contend for the host port.)
 - Crash recovery: on startup the CRI reaps sandbox microVMs orphaned by a
   previous crash/SIGKILL — it kills the leftover `a3s-box-shim` (matched by the
   box id in its argv), unmounts its overlay, and removes its box directory —

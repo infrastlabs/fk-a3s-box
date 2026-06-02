@@ -540,6 +540,15 @@ impl RuntimeService for BoxRuntimeService {
             }
         };
 
+        // For a default (TSI) pod that publishes ports but has no
+        // allocated/annotated IP, report the loopback as the pod IP: TSI binds
+        // 0.0.0.0:<hostPort> and forwards to the guest, so the pod's published
+        // ports are genuinely reachable at 127.0.0.1:<port> from the node (which
+        // is what a node-local CRI consumer / conformance GET targets).
+        if network_ip.is_empty() && !config.port_mappings.is_empty() {
+            network_ip = "127.0.0.1".to_string();
+        }
+
         // Store sandbox state
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let sandbox = PodSandbox {
