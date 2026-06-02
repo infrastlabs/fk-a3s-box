@@ -61,7 +61,10 @@ use network::{
     disconnect_sandbox_from_network_store, sandbox_network_name,
     sandbox_network_status_from_annotations, SandboxNetworkAllocation,
 };
-use stats::{container_stats, metric_descriptors, pod_sandbox_metrics, pod_sandbox_stats};
+use stats::{
+    container_stats, metric_descriptors, pod_sandbox_metrics, pod_sandbox_stats, read_vm_usage,
+    VmUsage,
+};
 use supervisor::{spawn_container_exit_supervisor, ContainerExitSupervisor, SupervisedWorkload};
 
 type CriResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -283,6 +286,23 @@ pub struct BoxRuntimeService {
 }
 
 impl BoxRuntimeService {
+    /// Real CPU + memory usage of a sandbox's microVM, read from the host-side
+    /// shim process (the shim *is* the pod in the microVM-per-pod model).
+    /// Returns zeros if the VM is not booted or its procfs is unreadable.
+    async fn sandbox_vm_usage(&self, sandbox_id: &str) -> VmUsage {
+        let pid = {
+            let vm_managers = self.vm_managers.read().await;
+            match vm_managers.get(sandbox_id) {
+                Some(vm) => vm.pid().await,
+                None => None,
+            }
+        };
+        match pid {
+            Some(pid) => read_vm_usage(pid),
+            None => VmUsage::default(),
+        }
+    }
+
     /// Create a new BoxRuntimeService with JSON-backed persistent state.
     pub fn new(
         image_store: Arc<ImageStore>,
@@ -2324,8 +2344,20 @@ impl RuntimeService for BoxRuntimeService {
             .await
             .ok_or_else(|| Status::not_found(format!("Container not found: {}", container_id)))?;
 
+        let running = self
+            .store
+            .containers
+            .list(Some(&container.sandbox_id), None)
+            .await
+            .into_iter()
+            .filter(|c| c.state == ContainerState::Running)
+            .count();
+        let usage = self
+            .sandbox_vm_usage(&container.sandbox_id)
+            .await
+            .per_container(running);
         Ok(Response::new(ContainerStatsResponse {
-            stats: Some(container_stats(&container).await),
+            stats: Some(container_stats(&container, usage).await),
         }))
     }
 
@@ -2364,7 +2396,30 @@ impl RuntimeService for BoxRuntimeService {
                 true
             })
             .collect();
-        let stats = join_all(containers.iter().map(container_stats)).await;
+        // Resolve each pod's VM usage once, split across its running containers.
+        let mut usage_by_sandbox: std::collections::HashMap<String, VmUsage> =
+            std::collections::HashMap::new();
+        for container in &containers {
+            if !usage_by_sandbox.contains_key(&container.sandbox_id) {
+                let running = containers
+                    .iter()
+                    .filter(|c| c.sandbox_id == container.sandbox_id)
+                    .count();
+                let usage = self
+                    .sandbox_vm_usage(&container.sandbox_id)
+                    .await
+                    .per_container(running);
+                usage_by_sandbox.insert(container.sandbox_id.clone(), usage);
+            }
+        }
+        let stats = join_all(containers.iter().map(|c| {
+            let usage = usage_by_sandbox
+                .get(&c.sandbox_id)
+                .copied()
+                .unwrap_or_default();
+            container_stats(c, usage)
+        }))
+        .await;
 
         Ok(Response::new(ListContainerStatsResponse { stats }))
     }
@@ -2400,9 +2455,10 @@ impl RuntimeService for BoxRuntimeService {
             .await
             .ok_or_else(|| Status::not_found(format!("Sandbox not found: {}", sandbox_id)))?;
         let containers = self.store.containers.list(Some(&sandbox_id), None).await;
+        let vm_usage = self.sandbox_vm_usage(&sandbox_id).await;
 
         Ok(Response::new(PodSandboxStatsResponse {
-            stats: Some(pod_sandbox_stats(&sandbox, containers).await),
+            stats: Some(pod_sandbox_stats(&sandbox, containers, vm_usage).await),
         }))
     }
 
@@ -2427,7 +2483,8 @@ impl RuntimeService for BoxRuntimeService {
             }
 
             let containers = self.store.containers.list(Some(&sandbox.id), None).await;
-            stats.push(pod_sandbox_stats(&sandbox, containers).await);
+            let vm_usage = self.sandbox_vm_usage(&sandbox.id).await;
+            stats.push(pod_sandbox_stats(&sandbox, containers, vm_usage).await);
         }
 
         Ok(Response::new(ListPodSandboxStatsResponse { stats }))
