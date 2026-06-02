@@ -465,6 +465,7 @@ async fn handle_exec_stdin_stream(
                         }
                         _ => {}
                     },
+                    Some(a3s_box_core::exec::ExecEvent::FlushAck) => {}
                     Some(a3s_box_core::exec::ExecEvent::Exit(_)) | None => break,
                 }
             }
@@ -633,6 +634,7 @@ async fn handle_attach_stream(
                         }
                         _ => {}
                     },
+                    Ok(a3s_box_core::exec::ExecEvent::FlushAck) => {}
                     Ok(a3s_box_core::exec::ExecEvent::Exit(_)) => break,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(

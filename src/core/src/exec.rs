@@ -103,11 +103,17 @@ pub struct ExecExit {
     pub oom_killed: bool,
 }
 
-/// A streaming exec event — either a chunk of output or the final exit.
+/// A streaming exec event — a chunk of output, a flush acknowledgement, or the
+/// final exit.
 #[derive(Debug, Clone)]
 pub enum ExecEvent {
     /// A chunk of stdout or stderr data.
     Chunk(ExecChunk),
+    /// Acknowledgement of a flush request: every output chunk the guest had
+    /// buffered when it received the flush has been sent ahead of this marker.
+    /// Used to establish a definitive pre/post boundary for log rotation
+    /// (`ReopenContainerLog`) without racing in-flight output.
+    FlushAck,
     /// The command has exited.
     Exit(ExecExit),
 }

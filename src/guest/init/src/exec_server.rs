@@ -22,6 +22,12 @@ use crate::user::{parse_process_user, ProcessUser};
 const STREAM_CHUNK_BYTES: usize = 16 * 1024;
 const EXEC_CONTROL_CANCEL: &[u8] = b"cancel";
 const EXEC_CONTROL_STDIN_CLOSE: &[u8] = b"stdin-close";
+/// Host→guest control: flush all buffered output, then reply with a flush-ack.
+const EXEC_CONTROL_FLUSH: &[u8] = b"flush";
+/// Guest→host marker (in a Control frame) acknowledging a flush: every output
+/// chunk buffered when the flush was received has been sent ahead of it. Must
+/// match the host's `EXEC_FLUSH_ACK` in `runtime/src/grpc/exec.rs`.
+const EXEC_FLUSH_ACK: &[u8] = b"flush-ack";
 
 /// Run the exec server, listening on vsock port 4089.
 ///
@@ -221,6 +227,8 @@ enum ExecInputEvent {
     Stdin(Vec<u8>),
     StdinClose,
     Cancel,
+    /// Flush buffered output and emit a flush-ack (log-rotation boundary).
+    Flush,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -243,6 +251,13 @@ fn spawn_exec_input_monitor(
                     && payload == EXEC_CONTROL_STDIN_CLOSE =>
             {
                 if tx.send(ExecInputEvent::StdinClose).is_err() {
+                    break;
+                }
+            }
+            Ok(Some((frame_type, payload)))
+                if frame_type == FrameType::Control as u8 && payload == EXEC_CONTROL_FLUSH =>
+            {
+                if tx.send(ExecInputEvent::Flush).is_err() {
                     break;
                 }
             }
@@ -324,6 +339,14 @@ fn write_exec_exit(
     };
     let payload = serde_json::to_vec(&exit)?;
     write_frame(w, FrameType::Control as u8, &payload)?;
+    Ok(())
+}
+
+/// Emit a flush-ack Control frame, marking that all output buffered when the
+/// flush was received has now been sent.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_exec_flush_ack(w: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
+    write_frame(w, FrameType::Control as u8, EXEC_FLUSH_ACK)?;
     Ok(())
 }
 
@@ -764,7 +787,7 @@ fn wait_streaming_child(
     let poll_interval = Duration::from_millis(20);
 
     loop {
-        if drain_exec_input_events(child, input_rx) {
+        if process_streaming_input(child, input_rx, receiver, writer)? {
             warn!("Streaming exec command received stop request, killing");
             kill_child_process_group(child);
             return Ok((137, Some(StreamingStopReason::Cancelled)));
@@ -777,7 +800,7 @@ fn wait_streaming_child(
             Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
         }
 
-        if drain_exec_input_events(child, input_rx) {
+        if process_streaming_input(child, input_rx, receiver, writer)? {
             warn!("Streaming exec command received stop request, killing");
             kill_child_process_group(child);
             return Ok((137, Some(StreamingStopReason::Cancelled)));
@@ -808,12 +831,21 @@ fn wait_streaming_child(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Default)]
+struct InputDrainOutcome {
+    /// A cancel/stop was requested.
+    cancel: bool,
+    /// A flush was requested (drain buffered output, then emit a flush-ack).
+    flush: bool,
+}
+
 fn drain_exec_input_events(
     child: &mut std::process::Child,
     input_rx: Option<&mpsc::Receiver<ExecInputEvent>>,
-) -> bool {
+) -> InputDrainOutcome {
+    let mut outcome = InputDrainOutcome::default();
     let Some(input_rx) = input_rx else {
-        return false;
+        return outcome;
     };
 
     loop {
@@ -822,10 +854,34 @@ fn drain_exec_input_events(
             Ok(ExecInputEvent::StdinClose) => {
                 let _ = child.stdin.take();
             }
-            Ok(ExecInputEvent::Cancel) => return true,
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return false,
+            Ok(ExecInputEvent::Flush) => outcome.flush = true,
+            Ok(ExecInputEvent::Cancel) => {
+                outcome.cancel = true;
+                return outcome;
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return outcome,
         }
     }
+}
+
+/// Process pending input events: apply stdin/close, and on a flush request
+/// drain all buffered output to the writer before emitting a flush-ack.
+/// Returns `true` if a cancel/stop was requested.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn process_streaming_input(
+    child: &mut std::process::Child,
+    input_rx: Option<&mpsc::Receiver<ExecInputEvent>>,
+    receiver: &mpsc::Receiver<StreamReaderEvent>,
+    writer: &mut impl Write,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let outcome = drain_exec_input_events(child, input_rx);
+    if outcome.flush {
+        // Everything the reader threads have queued is written first, so the
+        // ack marks a definitive boundary for log rotation.
+        drain_stream_reader_events(receiver, writer)?;
+        write_exec_flush_ack(writer)?;
+    }
+    Ok(outcome.cancel)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1890,6 +1946,67 @@ mod tests {
         }
 
         assert_eq!(stdout, b"hello live stdin");
+        assert_eq!(exit_code, Some(0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_execute_command_streaming_flush_emits_ack() {
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            execute_command_streaming(
+                ExecCommandSpec {
+                    cmd: &["cat".to_string()],
+                    timeout_ns: 5_000_000_000,
+                    env: &[],
+                    working_dir: None,
+                    rootfs: None,
+                    stdin_data: None,
+                    stdin_streaming: true,
+                    user: None,
+                },
+                Some(input_rx),
+                &mut buf,
+            )
+            .unwrap();
+            buf
+        });
+
+        input_tx
+            .send(ExecInputEvent::Stdin(b"echoed".to_vec()))
+            .unwrap();
+        input_tx.send(ExecInputEvent::Flush).unwrap();
+        input_tx.send(ExecInputEvent::StdinClose).unwrap();
+
+        let mut cursor = std::io::Cursor::new(handle.join().unwrap());
+        let mut stdout = Vec::new();
+        let mut flush_acks = 0;
+        let mut exit_code = None;
+
+        while let Some((ft, payload)) = read_frame(&mut cursor).unwrap() {
+            match ft {
+                ft if ft == FrameType::Data as u8 => {
+                    let chunk: ExecChunk = serde_json::from_slice(&payload).unwrap();
+                    if chunk.stream == StreamType::Stdout {
+                        stdout.extend_from_slice(&chunk.data);
+                    }
+                }
+                ft if ft == FrameType::Control as u8 && payload == EXEC_FLUSH_ACK => {
+                    flush_acks += 1;
+                }
+                ft if ft == FrameType::Control as u8 => {
+                    let exit: ExecExit = serde_json::from_slice(&payload).unwrap();
+                    exit_code = Some(exit.exit_code);
+                }
+                other => panic!("unexpected frame type: {other}"),
+            }
+        }
+
+        // A flush-ack was emitted in response to the Flush event, the echoed
+        // output was delivered, and the command still exited cleanly.
+        assert!(flush_acks >= 1, "expected at least one flush-ack frame");
+        assert_eq!(stdout, b"echoed");
         assert_eq!(exit_code, Some(0));
     }
 

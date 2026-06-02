@@ -396,6 +396,8 @@ pub async fn serve_exec(mut stream: TcpStream, session: &StreamingSession) -> Re
                         tracing::debug!(exit_code, "spdy exec: guest command exited");
                         break;
                     }
+                    // Flush-acks are only used by the log-rotation path; ignore.
+                    Ok(Some(ExecEvent::FlushAck)) => {}
                     Ok(None) | Err(_) => break,
                 }
             }
@@ -638,6 +640,7 @@ pub async fn serve_attach(
                                 .await;
                         }
                     }
+                    Ok(ExecEvent::FlushAck) => {}
                     Ok(ExecEvent::Exit(_)) => break,
                     Err(RecvError::Lagged(_)) => continue,
                     Err(RecvError::Closed) => break,

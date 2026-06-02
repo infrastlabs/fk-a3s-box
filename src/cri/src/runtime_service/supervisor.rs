@@ -39,6 +39,20 @@ impl SupervisedWorkload {
             Self::Pty(stream) => stream.cancel().await,
         }
     }
+
+    /// Request a flush of the guest's buffered output for a clean log-rotation
+    /// boundary. Returns `true` if a `FlushAck` should be awaited (exec
+    /// workloads), `false` if the workload does not support flushing (pty
+    /// workloads keep the prior best-effort reopen behaviour).
+    async fn flush(&mut self) -> a3s_box_core::error::Result<bool> {
+        match self {
+            Self::Exec(stream) => {
+                stream.flush().await?;
+                Ok(true)
+            }
+            Self::Pty(_) => Ok(false),
+        }
+    }
 }
 
 pub(super) struct ContainerExitSupervisor {
@@ -89,6 +103,9 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
         let mut log_writer = log_writer;
         let mut exit_code = -1;
         let mut oom_killed = false;
+        // Set when the workload exits while we are draining output for a
+        // log-rotation flush: reopen the log, then leave the supervision loop.
+        let mut reopen_then_exit = false;
 
         loop {
             tokio::select! {
@@ -96,6 +113,60 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
                     // CRI ReopenContainerLog: the kubelet rotated (renamed) the
                     // log file; reopen our writer at log_path so new output lands
                     // in a fresh file there.
+                    //
+                    // Before reopening, ask the guest to flush and drain every
+                    // chunk it had buffered into the OLD writer, stopping at the
+                    // FlushAck marker. This gives a definitive boundary so output
+                    // produced before the rotation cannot leak into the new file.
+                    let await_ack = match workload.flush().await {
+                        Ok(await_ack) => await_ack,
+                        Err(error) => {
+                            tracing::warn!(
+                                container_id = %container_id,
+                                error = %error,
+                                "Failed to send log-rotation flush; reopening without barrier"
+                            );
+                            false
+                        }
+                    };
+                    if await_ack {
+                        loop {
+                            match workload.next_event().await {
+                                Ok(Some(a3s_box_core::exec::ExecEvent::FlushAck)) => break,
+                                Ok(Some(a3s_box_core::exec::ExecEvent::Chunk(chunk))) => {
+                                    let _ = attach_tx.send(a3s_box_core::exec::ExecEvent::Chunk(chunk.clone()));
+                                    if let Some(writer) = log_writer.as_mut() {
+                                        if let Err(error) = writer.write_chunk(chunk.stream, &chunk.data).await {
+                                            tracing::warn!(
+                                                container_id = %container_id,
+                                                log_path = %log_path,
+                                                error = %error,
+                                                "Failed to write CRI container log during flush; disabling log writes"
+                                            );
+                                            log_writer = None;
+                                        }
+                                    }
+                                }
+                                Ok(Some(a3s_box_core::exec::ExecEvent::Exit(exit))) => {
+                                    exit_code = exit.exit_code;
+                                    oom_killed = exit.oom_killed;
+                                    reopen_then_exit = true;
+                                    break;
+                                }
+                                Ok(None) => { reopen_then_exit = true; break; }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        container_id = %container_id,
+                                        error = %error,
+                                        "Container workload supervision failed during log-rotation flush; recording synthetic failure exit"
+                                    );
+                                    exit_code = 255;
+                                    reopen_then_exit = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     match log_writer.as_mut() {
                         Some(writer) => {
                             if let Err(error) = writer.reopen().await {
@@ -114,6 +185,10 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
                     // Acknowledge so a synchronous ReopenContainerLog can return
                     // only now that the new log file is in place.
                     log_reopen_done.notify_one();
+                    // If the workload exited while we were draining, finish up.
+                    if reopen_then_exit {
+                        break;
+                    }
                 }
                 stop = &mut stop_rx, if !stop_requested => {
                     stop_requested = true;
@@ -149,6 +224,10 @@ pub(super) fn spawn_container_exit_supervisor(supervisor: ContainerExitSuperviso
                                     log_writer = None;
                                 }
                             }
+                        }
+                        Ok(Some(a3s_box_core::exec::ExecEvent::FlushAck)) => {
+                            // Only meaningful while draining for a log rotation
+                            // (handled in the reopen arm); ignore otherwise.
                         }
                         Ok(Some(a3s_box_core::exec::ExecEvent::Exit(exit))) => {
                             exit_code = exit.exit_code;
