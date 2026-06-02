@@ -90,9 +90,16 @@ critest --runtime-endpoint unix:///tmp/a3s-box.sock \
 
 ## Stability & hardening
 
-- **Crash recovery:** on startup the runtime reaps orphaned sandbox microVMs
-  left by a previous crash (kills the leftover shim, unmounts the overlay,
-  removes the rootfs dir) in addition to marking orphaned sandboxes NotReady.
+- **Leak-free under churn (validated):** 60 serial create/start/stop/remove pod
+  cycles + a 10-pod concurrent burst leave the server's RSS flat after warm-up
+  and fds/threads/shims/overlay-mounts/box-dirs all at zero — no per-pod leak.
+  `VmManager::destroy` now removes the box working directory for non-persistent
+  boxes (it previously leaked one `boxes/<id>` dir per pod, slowing later
+  RunPodSandbox until it timed out).
+- **Crash recovery (validated):** a hard `SIGKILL` of the CRI leaves 3 orphaned
+  microVMs (shims/mounts/box-dirs); on restart the runtime reaps all of them
+  (kills the shim, unmounts the overlay, removes the box dir) and marks the
+  sandboxes NotReady — zero leftovers after recovery.
 - **Graceful shutdown:** on SIGTERM/SIGINT the CRI drains the gRPC server then
   reaps every sandbox VM — no orphaned microVMs/overlays across restarts.
 - **Capability ordering:** container capabilities are applied *before* the
