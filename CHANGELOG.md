@@ -94,6 +94,16 @@ All notable changes to A3S Box will be documented in this file.
 
 ### Fixed
 - Docker build/runtime parity (found via a 51-case real-Linux probe):
+  - `COPY --chown` ownership is now honored at runtime. The layer tar headers
+    were stamped correctly, but the rootfs the container saw collapsed to root
+    (`stat` reported `0:0`): layer extraction did not set `preserve_ownerships`
+    and the overlay/rootfs-cache copy carried content/permissions but not
+    uid/gid. Both paths now restore the layer uid/gid (root only), so
+    `COPY --chown=4242:4343` shows `4242:4343` and `--chown=nobody` shows
+    `65534:65534`; non-root ownership baked into base images is preserved too.
+  - A relative `--workdir` (e.g. `-w sub`) is accepted and resolved against the
+    image WORKDIR (`/srv/app` + `sub` => `/srv/app/sub`), matching Docker;
+    previously any non-absolute workdir was rejected.
   - Build-time variable expansion now matches Docker: a later `ENV` value and
     `WORKDIR` expand earlier `ENV`/`ARG` (e.g. `ENV APPDIR=/srv/app` then
     `WORKDIR $APPDIR`), instead of keeping the literal `$APPDIR`. An undeclared
