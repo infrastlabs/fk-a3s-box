@@ -93,6 +93,13 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- Short-lived `run` no longer stalls ~10s before returning. A container that
+  exits quickly (e.g. `run alpine -- echo hi`) made the VM halt and the shim
+  become a zombie; the boot-readiness wait checked liveness with `kill(pid,0)`,
+  which reports a zombie as alive, so it waited the full exec-heartbeat timeout
+  (~10s, intermittently, depending on a boot race). Readiness now uses a
+  zombie-aware liveness check (`/proc` state on Linux) and returns promptly
+  (~1.7s). Also speeds up the monitor restarting fast-exiting containers.
 - `run`/`create` health flags accept Docker-style duration strings:
   `--health-interval 30s`, `--health-timeout 1m`, `--health-start-period 10s`
   (and compounds like `1m30s`) instead of only a bare integer, which was
