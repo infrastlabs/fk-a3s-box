@@ -821,14 +821,48 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
     use nix::mount::{mount, MsFlags};
 
     info!("Remounting rootfs as read-only (--read-only)");
-    mount(
+
+    // A direct `MS_REMOUNT|MS_RDONLY` of the virtio-fs root often fails with
+    // EBUSY. Fall back to the bind-remount trick (bind / onto itself, then
+    // remount that bind read-only), which succeeds where a direct remount
+    // cannot. If both fail, log and continue WRITABLE — a non-enforced
+    // --read-only is far less harmful than killing the container outright.
+    let direct = mount(
         None::<&str>,
         "/",
         None::<&str>,
         MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
         None::<&str>,
-    )?;
-    info!("Rootfs remounted read-only");
+    );
+    if direct.is_ok() {
+        info!("Rootfs remounted read-only");
+        return Ok(());
+    }
+
+    let bind = mount(
+        Some("/"),
+        "/",
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .and_then(|_| {
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+            None::<&str>,
+        )
+    });
+    match bind {
+        Ok(()) => info!("Rootfs remounted read-only (via bind)"),
+        Err(error) => warn!(
+            %error,
+            direct_error = ?direct.err(),
+            "Could not remount rootfs read-only; container runs writable"
+        ),
+    }
     Ok(())
 }
 

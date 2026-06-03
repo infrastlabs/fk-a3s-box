@@ -88,6 +88,14 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- `RUN chmod` (mode-only changes) are now captured into the build layer, so
+  the common `COPY script.sh` + `RUN chmod +x script.sh` makes the script
+  executable in the image (previously the chmod was dropped and the script
+  could not be run as the entrypoint).
+- `--read-only` no longer crashes the container: a direct read-only remount of
+  the virtio-fs root can fail with EBUSY, which was fatal to init. It now falls
+  back to a bind-remount and, if that also fails, logs a warning and runs the
+  container writable instead of killing it.
 - Multi-variable `ENV KEY1=V1 KEY2=V2` (several pairs on one line) was parsed
   as a single variable swallowing the rest (`KEY1="V1 KEY2=V2"`), so only the
   first key got set and downstream `$KEY2` expanded empty. ENV now parses all
