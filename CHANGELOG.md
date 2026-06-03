@@ -49,6 +49,11 @@ All notable changes to A3S Box will be documented in this file.
   flush and drains every buffered output chunk into the old log file (stopping
   at a flush-ack marker added to the exec protocol) before reopening, so output
   produced before the rotation cannot leak into the new file.
+- `network prune` removes all networks not used by at least one box, and
+  `system prune` now reaps unused networks too (matching `docker network prune`
+  and `docker system prune`). A network is kept while it has a live endpoint or
+  any box record (running or stopped) references it; predefined `bridge`/`host`/
+  `none` are never pruned.
 
 ### Security
 - Host network/IPC namespaces are now rejected fail-closed: a pod or container

@@ -211,6 +211,7 @@ a3s-box network inspect backend
 a3s-box network connect backend stopped-box
 a3s-box network disconnect backend stopped-box
 a3s-box network rm --force backend
+a3s-box network prune --force   # remove all networks not used by any box
 a3s-box port api
 ```
 
