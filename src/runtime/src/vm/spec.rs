@@ -405,17 +405,26 @@ impl VmManager {
         config: &a3s_box_core::config::BoxConfig,
         oci_config: Option<&OciImageConfig>,
     ) -> String {
-        config
+        let image_workdir = oci_config
+            .and_then(|oci| oci.working_dir.clone())
+            .filter(|workdir| !workdir.is_empty());
+
+        match config
             .workdir
             .as_ref()
             .filter(|workdir| !workdir.is_empty())
-            .cloned()
-            .or_else(|| {
-                oci_config
-                    .and_then(|oci| oci.working_dir.clone())
-                    .filter(|workdir| !workdir.is_empty())
-            })
-            .unwrap_or_else(|| GUEST_WORKDIR.to_string())
+        {
+            // Absolute override is used as-is.
+            Some(workdir) if workdir.starts_with('/') => workdir.clone(),
+            // Relative override resolves against the image WORKDIR (Docker's
+            // `-w sub` => <image WORKDIR>/sub), falling back to `/` as the base.
+            Some(workdir) => {
+                let base = image_workdir.unwrap_or_else(|| "/".to_string());
+                let base = base.trim_end_matches('/');
+                format!("{}/{}", base, workdir.trim_start_matches('/'))
+            }
+            None => image_workdir.unwrap_or_else(|| GUEST_WORKDIR.to_string()),
+        }
     }
 
     fn effective_user(
@@ -904,6 +913,32 @@ mod tests {
             .env
             .iter()
             .any(|(key, value)| key == "BOX_EXEC_WORKDIR" && value == "/override"));
+    }
+
+    #[test]
+    fn test_relative_workdir_resolves_against_image_workdir() {
+        // Docker `-w sub` resolves against the image WORKDIR.
+        let oci = test_oci_config(Some("/srv/app"), None);
+        let cfg = BoxConfig {
+            workdir: Some("sub".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            VmManager::effective_workdir(&cfg, Some(&oci)),
+            "/srv/app/sub"
+        );
+        // Absolute override is used verbatim.
+        let cfg_abs = BoxConfig {
+            workdir: Some("/abs".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(VmManager::effective_workdir(&cfg_abs, Some(&oci)), "/abs");
+        // Relative with no image WORKDIR resolves against `/`.
+        let cfg_rel = BoxConfig {
+            workdir: Some("work".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(VmManager::effective_workdir(&cfg_rel, None), "/work");
     }
 
     #[test]

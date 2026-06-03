@@ -251,6 +251,20 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     // Step 7: Launch container entrypoint
     info!("Launching container entrypoint");
 
+    // Ensure the working directory exists — Docker creates a missing WORKDIR /
+    // `-w` path before chdir. Best-effort: a pre-existing dir is fine, and a
+    // read-only rootfs (where creation fails) matches Docker's inability to
+    // create it there.
+    if !exec_config.workdir.is_empty() && exec_config.workdir != "/" {
+        if let Err(e) = std::fs::create_dir_all(&exec_config.workdir) {
+            warn!(
+                workdir = %exec_config.workdir,
+                error = %e,
+                "Could not pre-create working directory (continuing)"
+            );
+        }
+    }
+
     // Convert args to &str for spawn_isolated
     let args_refs: Vec<&str> = exec_config.args.iter().map(|s| s.as_str()).collect();
     let env_refs: Vec<(&str, &str)> = exec_config
