@@ -432,11 +432,8 @@ pub(crate) fn validate_workdir_option(workdir: Option<&str>) -> Result<(), Strin
     if workdir.contains('\0') {
         return Err("--workdir must not contain NUL bytes".to_string());
     }
-    if !workdir.starts_with('/') {
-        return Err(format!(
-            "Invalid --workdir '{workdir}' (expected an absolute in-box path)"
-        ));
-    }
+    // A relative --workdir is allowed: like Docker, it resolves against the
+    // image WORKDIR at runtime (see VmManager::effective_workdir).
     Ok(())
 }
 
@@ -903,13 +900,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_runtime_options_rejects_relative_workdir() {
+    fn test_validate_runtime_options_accepts_relative_workdir() {
+        // A relative --workdir is accepted (resolved against the image WORKDIR
+        // at runtime, like Docker's `-w sub`).
         let mut args = default_common_args();
         args.workdir = Some("app".to_string());
 
-        let err = validate_runtime_options(&args).unwrap_err();
-
-        assert!(err.contains("absolute"));
+        validate_runtime_options(&args).unwrap();
     }
 
     #[test]
