@@ -709,6 +709,15 @@ fn execute_command(
                 }
                 std::thread::sleep(poll_interval);
             }
+            Err(ref e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                // Child already reaped (timing race in microVM PID 1 context).
+                let (stdout, stderr) = read_child_output(&mut child);
+                return ExecOutput {
+                    stdout: truncate_output(stdout),
+                    stderr: truncate_output(stderr),
+                    exit_code: 0,
+                };
+            }
             Err(e) => {
                 return ExecOutput {
                     stdout: vec![],
@@ -817,6 +826,15 @@ fn wait_streaming_child(
                     kill_child_process_group(child);
                     return Ok((137, Some(StreamingStopReason::Timeout)));
                 }
+            }
+            Err(ref e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                // The child exited and was reaped before this try_wait — a
+                // timing race where the output pipes closed (confirming the
+                // child finished) but the zombie was collected first (can happen
+                // inside microVMs where PID 1's housekeeping overlaps). Treat
+                // as a clean exit (code 0); the caller observes the output.
+                drain_stream_reader_events(receiver, writer)?;
+                return Ok((0, None));
             }
             Err(e) => {
                 write_exec_stream_chunk(
