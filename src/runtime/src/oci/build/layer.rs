@@ -18,6 +18,10 @@ pub struct FileEntry {
     pub size: u64,
     /// Modification time (seconds since epoch)
     pub mtime: i64,
+    /// Unix permission/mode bits. A `chmod` (e.g. `RUN chmod +x`) changes only
+    /// this — not size or mtime — so it must be part of the change check or the
+    /// new mode is silently dropped from the layer.
+    pub mode: u32,
     /// Whether this is a directory
     pub is_dir: bool,
 }
@@ -50,9 +54,12 @@ impl DirSnapshot {
                     changed.push(path.clone());
                 }
                 Some(before_entry) => {
-                    // Modified: size or mtime changed
+                    // Modified: size, mtime, or mode changed. Mode matters for
+                    // `RUN chmod` (e.g. making a COPY'd script executable), which
+                    // touches neither size nor mtime.
                     if before_entry.size != after_entry.size
                         || before_entry.mtime != after_entry.mtime
+                        || before_entry.mode != after_entry.mode
                     {
                         changed.push(path.clone());
                     }
@@ -109,12 +116,21 @@ fn walk_dir(root: &Path, current: &Path, entries: &mut HashMap<PathBuf, FileEntr
             })
             .unwrap_or(0);
 
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode()
+        };
+        #[cfg(not(unix))]
+        let mode = 0u32;
+
         entries.insert(
             relative.clone(),
             FileEntry {
                 path: relative,
                 size: metadata.len(),
                 mtime,
+                mode,
                 is_dir: metadata.is_dir(),
             },
         );
@@ -478,6 +494,26 @@ mod tests {
 
         let diff = before.diff(&after);
         assert_eq!(diff, vec![PathBuf::from("a.txt")]);
+    }
+
+    /// Regression: a `chmod`-only change (e.g. `RUN chmod +x`) changes the mode
+    /// but not size or mtime, and must still be detected so the new mode lands
+    /// in the layer (else a COPY'd script stays non-executable -> exec EACCES).
+    #[test]
+    #[cfg(unix)]
+    fn test_snapshot_diff_detects_chmod_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("entry.sh");
+        fs::write(&f, "#!/bin/sh\necho hi\n").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let before = DirSnapshot::capture(tmp.path()).unwrap();
+        // chmod +x: mode 0644 -> 0755, same content/size, same mtime.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+        let after = DirSnapshot::capture(tmp.path()).unwrap();
+
+        assert_eq!(before.diff(&after), vec![PathBuf::from("entry.sh")]);
     }
 
     #[test]
