@@ -162,11 +162,13 @@ pub fn spawn_isolated(
     args: &[&str],
     env: &[(&str, &str)],
     workdir: &str,
+    user: Option<&str>,
 ) -> Result<u32, NamespaceError> {
     tracing::info!(
         command = %command,
         args = ?args,
         workdir = %workdir,
+        user = ?user,
         "Spawning process in isolated namespace"
     );
 
@@ -174,7 +176,7 @@ pub fn spawn_isolated(
     match unsafe { fork() }.map_err(NamespaceError::ForkFailed)? {
         ForkResult::Child => {
             // Child process: create namespaces and exec
-            if let Err(e) = child_process(config, command, args, env, workdir) {
+            if let Err(e) = child_process(config, command, args, env, workdir, user) {
                 tracing::error!("Child process failed: {}", e);
                 std::process::exit(1);
             }
@@ -197,6 +199,7 @@ fn child_process(
     args: &[&str],
     env: &[(&str, &str)],
     workdir: &str,
+    user: Option<&str>,
 ) -> Result<(), NamespaceError> {
     // Create new namespaces
     let flags = config.to_clone_flags();
@@ -264,8 +267,15 @@ fn child_process(
         cmd.env(key, value);
     }
 
-    // Apply security restrictions before exec
-    apply_security_before_exec(&mut cmd)?;
+    // Resolve the container user (image USER / --user) against the container
+    // rootfs (already pivoted to "/"), the same way the exec server does:
+    // names -> uid:gid via /etc/passwd, default the primary gid from passwd,
+    // and gather image supplemental groups. Done here (pre-fork, allocating) so
+    // the pre_exec hook only performs async-signal-safe syscalls.
+    let (process_user, supplemental_groups) = resolve_user_and_groups(user);
+
+    // Apply security restrictions + user before exec
+    apply_security_before_exec(&mut cmd, process_user, supplemental_groups)?;
 
     tracing::debug!("Executing command: {} {:?}", command, args);
 
@@ -295,21 +305,54 @@ fn resolve_command_path(command: &str, env: &[(&str, &str)]) -> Option<PathBuf> 
         .find(|path| path.exists())
 }
 
-/// Apply security restrictions (seccomp, no-new-privileges, capabilities)
-/// before exec using the pre_exec hook.
+/// Resolve a container user string (`uid`, `uid:gid`, `root`, or a name) to a
+/// numeric [`ProcessUser`] plus its image supplementary groups, looking names up
+/// in the container rootfs (already pivoted to `/`). Returns `(None, [])` when no
+/// user is requested or the name cannot be resolved/parsed (the process then runs
+/// as root, the prior behaviour). Pure file reads — call pre-fork.
+#[cfg(target_os = "linux")]
+fn resolve_user_and_groups(user: Option<&str>) -> (Option<crate::user::ProcessUser>, Vec<u32>) {
+    let Some(user) = user.map(str::trim).filter(|u| !u.is_empty()) else {
+        return (None, Vec::new());
+    };
+    // Names -> "uid:gid" via the container /etc/passwd; numeric/root pass through.
+    let resolved = crate::user::resolve_named_user(user, "/").unwrap_or_else(|| user.to_string());
+    let mut process_user = match crate::user::parse_process_user(Some(&resolved)) {
+        Ok(Some(pu)) => pu,
+        _ => {
+            tracing::warn!(user, "Could not resolve container user; running as root");
+            return (None, Vec::new());
+        }
+    };
+    // Default the primary gid from the user's passwd entry (RunAsUser semantics).
+    if process_user.gid.is_none() {
+        process_user.gid = crate::user::primary_gid_for_uid("/", process_user.uid);
+    }
+    let groups =
+        crate::user::resolve_image_groups("/", process_user.uid, process_user.gid, user);
+    (Some(process_user), groups)
+}
+
+/// Apply security restrictions (seccomp, no-new-privileges, capabilities) and
+/// the container user before exec using the pre_exec hook.
 ///
 /// Reads security configuration from `A3S_SEC_*` environment variables
 /// set by the host runtime.
 #[cfg(target_os = "linux")]
-fn apply_security_before_exec(cmd: &mut Command) -> Result<(), NamespaceError> {
+fn apply_security_before_exec(
+    cmd: &mut Command,
+    process_user: Option<crate::user::ProcessUser>,
+    supplemental_groups: Vec<u32>,
+) -> Result<(), NamespaceError> {
     use a3s_box_core::security::{SeccompMode, SecurityConfig};
 
     let config = SecurityConfig::from_env_vars();
 
-    // Privileged mode: skip all security restrictions
-    if config.privileged {
-        tracing::info!("Privileged mode: skipping security restrictions");
-        return Ok(());
+    // Privileged mode skips seccomp/caps/no-new-privs — but the container USER
+    // (image USER / --user) is still honored, so it is applied below regardless.
+    let privileged = config.privileged;
+    if privileged {
+        tracing::info!("Privileged mode: skipping seccomp/caps/no-new-privs");
     }
 
     tracing::debug!(
@@ -317,12 +360,21 @@ fn apply_security_before_exec(cmd: &mut Command) -> Result<(), NamespaceError> {
         no_new_privs = config.no_new_privileges,
         cap_add = ?config.cap_add,
         cap_drop = ?config.cap_drop,
+        user = ?process_user,
         "Applying security configuration"
     );
 
-    let no_new_privs = config.no_new_privileges;
-    let seccomp_mode = config.seccomp.clone();
-    let cap_drop = config.cap_drop.clone();
+    let no_new_privs = config.no_new_privileges && !privileged;
+    let seccomp_mode = if privileged {
+        SeccompMode::Unconfined
+    } else {
+        config.seccomp.clone()
+    };
+    let cap_drop = if privileged {
+        Vec::new()
+    } else {
+        config.cap_drop.clone()
+    };
 
     // Build the seccomp BPF filter BEFORE fork. Building allocates, which is
     // not async-signal-safe in the post-fork child (malloc may deadlock on
@@ -339,7 +391,7 @@ fn apply_security_before_exec(cmd: &mut Command) -> Result<(), NamespaceError> {
     // built above, pre-fork.
     unsafe {
         cmd.pre_exec(move || {
-            // 1. Set no-new-privileges
+            // 1. Set no-new-privileges (does not block the setuid syscall below).
             if no_new_privs {
                 let ret = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
                 if ret != 0 {
@@ -347,12 +399,31 @@ fn apply_security_before_exec(cmd: &mut Command) -> Result<(), NamespaceError> {
                 }
             }
 
-            // 2. Drop capabilities
+            // 2. Apply the container user, in the proven order used by the exec
+            //    server: supplemental groups -> capabilities -> setgid+setuid.
+            //    Each step needs root/CAP_SET*; setuid is LAST because it clears
+            //    the privileges needed by the earlier ones.
+            if process_user.is_some() && !supplemental_groups.is_empty() {
+                let ret = libc::setgroups(
+                    supplemental_groups.len() as _,
+                    supplemental_groups.as_ptr() as *const libc::gid_t,
+                );
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+
+            // 3. Drop capabilities (while still root, before the uid switch).
             if should_drop_caps(&cap_drop) {
                 drop_capabilities(&cap_drop)?;
             }
 
-            // 3. Apply seccomp filter (prebuilt before fork)
+            // 4. Drop to the target uid/gid (image USER / --user).
+            if let Some(user) = process_user {
+                user.apply()?;
+            }
+
+            // 5. Apply seccomp filter (prebuilt before fork)
             match &seccomp_mode {
                 SeccompMode::Default => {
                     if let Some(filter) = &seccomp_filter {
@@ -920,6 +991,7 @@ fn child_process(
     args: &[&str],
     env: &[(&str, &str)],
     workdir: &str,
+    _user: Option<&str>,
 ) -> Result<(), NamespaceError> {
     // On non-Linux, just exec without namespace isolation or security
     tracing::warn!("Namespace isolation and security enforcement not available on this platform");

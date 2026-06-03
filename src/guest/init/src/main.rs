@@ -28,6 +28,9 @@ struct ExecConfig {
     env: Vec<(String, String)>,
     /// Working directory
     workdir: String,
+    /// Container user (`uid`, `uid:gid`, `root`, or a name resolved via the
+    /// image `/etc/passwd`). Applied to the main process before exec.
+    user: Option<String>,
 }
 
 impl ExecConfig {
@@ -56,6 +59,11 @@ impl ExecConfig {
 
         let workdir = std::env::var("BOX_EXEC_WORKDIR").unwrap_or_else(|_| "/".to_string());
 
+        // Optional container user (image USER directive or CLI --user).
+        let user = std::env::var("BOX_EXEC_USER")
+            .ok()
+            .filter(|u| !u.is_empty());
+
         // Collect BOX_EXEC_ENV_* variables
         let env: Vec<(String, String)> = std::env::vars()
             .filter_map(|(key, value)| {
@@ -69,6 +77,7 @@ impl ExecConfig {
             args,
             env,
             workdir,
+            user,
         }
     }
 }
@@ -256,6 +265,7 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         &args_refs,
         &env_refs,
         &exec_config.workdir,
+        exec_config.user.as_deref(),
     )?;
     let container_pid = nix::unistd::Pid::from_raw(container_pid_raw as i32);
 

@@ -88,6 +88,14 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- Image `USER` (named or numeric) and `run --user` are now applied to the
+  container MAIN process, by the guest init right before exec (setgroups +
+  setgid + setuid, after PID 1 finishes its root-only setup), reusing the same
+  resolver the exec path uses (names via the image /etc/passwd, image
+  supplementary groups). Previously this went through the shim's libkrun
+  set_uid, which dropped the guest PID 1 to that user and could not work at all:
+  a named USER was silently skipped (ran as root) and a numeric one crashed the
+  container. Now `USER appuser` runs the process as appuser.
 - `save`/`load` now round-trip the image tag: `save` stamps the image reference
   into the OCI `index.json` `org.opencontainers.image.ref.name` annotation, so
   `load` restores the tag (e.g. `rt:9`) instead of importing the image untagged
