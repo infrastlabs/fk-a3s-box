@@ -108,6 +108,7 @@ mod tests {
             src: vec![src.to_string()],
             dst: dst.to_string(),
             from: None,
+            chown: None,
         }
     }
 

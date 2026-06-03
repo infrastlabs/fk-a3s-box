@@ -7,7 +7,7 @@ use a3s_box_core::error::{BoxError, Result};
 use super::super::dockerfile::Instruction;
 use super::super::dockerignore::DockerIgnore;
 use super::super::layer::{
-    create_layer, create_layer_from_dir, create_layer_from_dir_with_chown,
+    create_layer, create_layer_from_dir_with_chown,
     create_layer_with_chown, LayerInfo,
 };
 use super::utils::{
@@ -440,12 +440,11 @@ pub(super) fn handle_add(
     layer_index: usize,
     ignore: Option<&DockerIgnore>,
 ) -> Result<LayerInfo> {
-    if let Some(chown) = chown {
-        return Err(BoxError::BuildError(format!(
-            "ADD --chown={} is not supported yet",
-            chown
-        )));
-    }
+    let chown_ids = if let Some(spec) = chown {
+        Some(resolve_chown(spec, rootfs_dir)?)
+    } else {
+        None
+    };
 
     let resolved_dst = resolve_path(workdir, dst);
     let dst_in_rootfs = rootfs_dir.join(resolved_dst.trim_start_matches('/'));
@@ -541,18 +540,18 @@ pub(super) fn handle_add(
         }
     }
 
-    // Create a layer from the destination
+    // Create a layer from the destination, stamping --chown into tar headers.
     let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
     let target_prefix = Path::new(resolved_dst.trim_start_matches('/'));
     if dst_in_rootfs.is_dir() {
-        create_layer_from_dir(&dst_in_rootfs, target_prefix, &layer_path)
+        create_layer_from_dir_with_chown(&dst_in_rootfs, target_prefix, &layer_path, chown_ids)
     } else if dst_in_rootfs.parent().is_some() {
         let changed = vec![PathBuf::from(
             dst_in_rootfs
                 .strip_prefix(rootfs_dir)
                 .unwrap_or(target_prefix),
         )];
-        create_layer(rootfs_dir, &changed, &layer_path)
+        create_layer_with_chown(rootfs_dir, &changed, &layer_path, chown_ids)
     } else {
         Err(BoxError::BuildError("Invalid ADD destination".to_string()))
     }
@@ -969,14 +968,17 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_add_rejects_chown() {
+    fn test_handle_add_chown_numeric_uid_gid() {
         let tmp = tempfile::TempDir::new().unwrap();
         let rootfs = tmp.path().join("rootfs");
         let layers = tmp.path().join("layers");
         std::fs::create_dir_all(&rootfs).unwrap();
         std::fs::create_dir_all(&layers).unwrap();
+        // Write the file so ADD can find it
+        std::fs::write(tmp.path().join("file.txt"), "data").unwrap();
 
-        let err = handle_add(
+        // Numeric uid:gid — resolves without /etc/passwd, should succeed.
+        let result = handle_add(
             &["file.txt".to_string()],
             "/tmp/file.txt",
             Some("1000:1000"),
@@ -986,11 +988,10 @@ mod tests {
             "/",
             0,
             None,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("ADD --chown=1000:1000 is not supported yet"));
+        );
+        assert!(result.is_ok(), "ADD --chown with numeric uid:gid should succeed: {:?}", result.err());
+        // Checking that the layer was created is sufficient for unit coverage.
+        assert!(result.unwrap().path.exists());
     }
 
     #[test]

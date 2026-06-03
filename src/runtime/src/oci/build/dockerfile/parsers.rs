@@ -230,7 +230,7 @@ pub(super) fn parse_add(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    let remaining = reject_add_flags(rest, line_num)?;
+    let (chown_from_flag, remaining) = parse_add_flags(rest, line_num)?;
     if remaining.starts_with('[') {
         return Err(BoxError::BuildError(format!(
             "Line {}: ADD JSON array form is not supported yet",
@@ -257,7 +257,7 @@ pub(super) fn parse_add(rest: &str, line_num: usize) -> Result<Instruction> {
     Ok(Instruction::Add {
         src,
         dst,
-        chown: None,
+        chown: chown_from_flag,
     })
 }
 
@@ -498,17 +498,24 @@ fn parse_copy_flags(rest: &str, line_num: usize) -> Result<(Option<String>, Opti
     }
 }
 
-fn reject_add_flags(rest: &str, line_num: usize) -> Result<&str> {
-    let trimmed = rest.trim_start();
-    if let Some(flag) = trimmed
-        .split_whitespace()
-        .next()
-        .filter(|s| s.starts_with("--"))
-    {
+/// Returns `(chown, remaining_args)`.
+fn parse_add_flags(rest: &str, line_num: usize) -> Result<(Option<String>, &str)> {
+    let mut chown = None;
+    let mut remaining = rest;
+    loop {
+        let trimmed = remaining.trim_start();
+        if !trimmed.starts_with("--") {
+            return Ok((chown, trimmed));
+        }
+        let (flag, after) = split_first_word(trimmed);
+        if let Some(owner) = flag.strip_prefix("--chown=") {
+            chown = Some(owner.to_string());
+            remaining = after;
+            continue;
+        }
         return Err(BoxError::BuildError(format!(
-            "Line {}: ADD flag '{}' is not supported yet",
+            "Line {}: ADD flag '{}' is not supported (supported: --chown=user[:group])",
             line_num, flag
         )));
     }
-    Ok(trimmed)
 }

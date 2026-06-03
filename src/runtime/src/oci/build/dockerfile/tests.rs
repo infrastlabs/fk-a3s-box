@@ -506,11 +506,16 @@ CMD ["app.py"]
     }
 
     #[test]
-    fn test_parse_add_rejects_chown() {
-        let err = parsers::parse_add("--chown=1000:1000 files/ /data/", 1)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("ADD flag '--chown=1000:1000' is not supported yet"));
+    fn test_parse_add_chown() {
+        let result = parsers::parse_add("--chown=1000:1000 files/ /data/", 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Add {
+                src: vec!["files/".to_string()],
+                dst: "/data/".to_string(),
+                chown: Some("1000:1000".to_string()),
+            }
+        );
     }
 
     #[test]

@@ -21,6 +21,9 @@ All notable changes to A3S Box will be documented in this file.
   the guest applies the groups that user belongs to per the image's `/etc/group`
   (runc-style initgroups) and defaults the primary gid to the user's
   `/etc/passwd` group when no `RunAsGroup` is set.
+- `ADD --chown=user[:group]` is now supported (was "not supported yet").
+- COPY/ADD `--chown` now also resolves named users/groups from the rootfs
+  `/etc/passwd`/`/etc/group`, not only numeric IDs.
 - `.dockerignore` support: a context-root `.dockerignore` now excludes matching
   paths from `COPY`/`ADD` (comments, blank lines, `!` negation with last-match-
   wins, and `?`/`*`/`**` globs). Previously `COPY . /app` copied everything —
