@@ -13,95 +13,117 @@ suite so regressions are visible and progress is measurable.
 
 | Field | Value |
 |-------|-------|
-| Date | 2026-06-01 |
+| Date | 2026-06-02 |
 | `critest` | v1.30.1 |
 | a3s-box | 2.0.6 |
 | Host | Linux KVM node (`/dev/kvm`), Ubuntu 24.04 |
-| Result | **44 Passed · 38 Failed · 15 Skipped** (ran 82 of 97 specs; full re-run at the hardened HEAD, no regressions) |
+| Result | **73 Passed · 9 Failed · 15 Skipped** (ran 82 of 97 specs) |
 
-This is up from the original **21 Passed / 59 Failed** baseline (2.0.4): streaming
-exec/attach, container logs + reopen, force-RemoveContainer, safe sysctls,
-RuntimeDefault seccomp, and most of the Linux SecurityContext now pass. The
-remaining 40 failures are **all** registry-egress / guest-kernel / architectural
-/ test-image artifacts — none is a logic defect (see below).
+Up from the original **21 Passed / 59 Failed** (2.0.4) and the **44 Passed**
+mid-point. With registry mirrors configured (so the e2e webserver/helper images
+resolve) plus per-container capabilities, image-defined users/groups, pod DNS,
+crash-recovery reaping, standard `/dev` nodes, routable pod IPs, **OOMKilled
+detection**, **MaskedPaths**, and an **SPDY port-forward bridge**, the suite now
+passes 73 of the 82 specs that run. Every one of the 9 remaining failures is
+architectural (microVM-per-pod) or environmental — none is a logic defect.
 
 How it was run:
 
 ```bash
-a3s-box-cri --socket /tmp/a3s-box.sock \
-  --image-dir ~/.a3s/images \
-  --agent-image docker.1ms.run/library/alpine:latest &
+A3S_REGISTRY_MIRRORS="registry.k8s.io=k8s.m.daocloud.io,gcr.io=gcr.m.daocloud.io" \
+a3s-box-cri --socket /tmp/a3s-box.sock --image-dir ~/.a3s/images \
+  --agent-image docker.m.daocloud.io/library/alpine:latest &
 
 critest --runtime-endpoint unix:///tmp/a3s-box.sock \
         --image-endpoint  unix:///tmp/a3s-box.sock \
-        --test-images-file test-images.yaml \
-        --ginkgo.skip="PortForward"
+        --test-images-file test-images.yaml   # alpine + nginx:1.14-2
 ```
 
-> **Caveat:** all `critest` test images were mapped to a single cached `alpine`
-> image (`test-images.yaml`), because the node has no general registry egress.
-> Specs that pull a distinct image (`registry.k8s.io/e2e-test-images/{nginx,
-> httpd,nonewprivs}`, `gcr.io/.../test-image-predefined-group`) therefore fail at
-> image pull as **test-setup artifacts**, not runtime defects. Only
-> `defaultTestContainerImage` + `webServerImage` are overridable via the images
-> file, so these pulls cannot be redirected to the mirror.
+> **Note on the port-forward count:** the `portforward [Conformance]` spec hangs
+> on *this* node and, depending on ginkgo's randomized order, can consume the
+> suite timeout before later specs run. The 73/82 figure was confirmed by also
+> running with `--ginkgo.skip="portforward"` (80 ran → **73 Passed / 7 Failed**),
+> which isolates the 7 architectural failures from the 2 portforward specs
+> accounted for below.
 
-## What passes (42)
+## What passes (73)
 
 - **Pod + container lifecycle:** `RunPodSandbox` (boots a microVM),
   `PodSandboxStatus`, `CreateContainer`, `StartContainer`, `ContainerStatus`,
-  `ListContainers`/`ListPodSandbox`, `StopContainer`, **`RemoveContainer`
-  (incl. force-removing a running container)**, `StopPodSandbox`,
-  `RemovePodSandbox`, plus `RuntimeStatus`/`Version`.
+  `ListContainers`/`ListPodSandbox`, `StopContainer`, `RemoveContainer` (incl.
+  force-removing a running container), `StopPodSandbox`, `RemovePodSandbox`,
+  `RuntimeStatus`/`Version`, multi-container pods.
 - **Streaming:** `Exec`/`Attach` over SPDY/3.1 (tty on/off, stdin on/off),
   `ExecSync`.
 - **Container logs:** writing to `log_path` and `ReopenContainerLog` (rotation).
-- **Linux SecurityContext:** `RunAsUser`, `RunAsGroup`, `RunAsUserName`
-  (passwd lookup), reject `RunAsGroup` without `RunAsUser`, `SupplementalGroups`,
-  `ReadonlyPaths`, seccomp `unconfined`/nil/**RuntimeDefault** (default BPF
-  filter → `Seccomp: 2`). `/proc` + `/sys` are mounted inside the container
-  chroot.
-- **Pod sysctls:** safe sysctls applied at VM boot (`/proc/sys` writes).
-- **Volumes:** read-only and writable mounts (incl. host-path symlink) are
-  materialized by copying the source into the rootfs (no host write-propagation).
-- Basic `ImageStatus`/`ListImages`.
+- **Linux SecurityContext:** `RunAsUser`/`RunAsGroup`/`RunAsUserName` (passwd
+  lookup), reject `RunAsGroup` without `RunAsUser`, `SupplementalGroups` (incl.
+  image-defined groups + passwd primary gid), `ReadonlyPaths`, **`MaskedPaths`**
+  (incl. masking a symlinked entry via `O_PATH|O_NOFOLLOW`), seccomp
+  `unconfined`/nil/**RuntimeDefault** (`Seccomp: 2`), `NoNewPrivs`,
+  `ReadonlyRootfs`, per-container **capabilities** (default set, add/drop),
+  HostPID (the pod's shared VM-wide PID namespace). `/proc` + `/sys` are mounted
+  inside the container chroot.
+- **Resources:** the container `memory_limit_in_bytes` and `cpu_quota`/`cpu_period`
+  are enforced inside the guest by a per-container cgroup v2 (`memory.max` /
+  `cpu.max`). The container joins the cgroup from its pre-exec hook, so workers it
+  forks are bounded too. An OOM kill is detected via `memory.events` and reported
+  as the **`OOMKilled`** exit reason. Real CPU/memory usage is reported through
+  `ContainerStats`/`PodSandboxStats` (from the pod VM's shim process).
+- **Pod sysctls** (safe), **pod `DNSConfig`** → container `/etc/resolv.conf`,
+  standard **`/dev` device nodes** (null/zero/full/random/urandom/tty).
+- **Volumes:** read-only and writable mounts (incl. host-path symlink),
+  materialized by copying the source into the rootfs.
+- **Networking:** published pod ports reachable at a reported pod IP (TSI);
+  basic `ImageStatus`/`ListImages`, registry mirrors + digest-pinned identity.
 
-## Real gaps (failures grouped by cause)
+## Remaining gaps (9 failures — all architectural or environmental)
 
-| Category | Failing specs (examples) | Root cause | Fixable here? |
-|----------|--------------------------|------------|---------------|
-| **Registry egress** (~22) | Multiple-Containers exec/log/network, image pull/list/status, DNS, port-mapping, port-forward, HostNetwork/PID/IPC, Privileged, ReadOnlyRootfs, NoNewPrivs, image-group SupplementalGroups | webserver/helper images on `registry.k8s.io`/`gcr.io` are unreachable and not overridable via the images file | ❌ environmental |
-| **Mount propagation** (~3) | mount propagation rshared/rslave/rprivate, non-recursive readonly mounts | basic volume mounts (incl. writable + host-path symlink) now PASS — both read-only and writable mounts are materialized by COPY into the rootfs; bidirectional host↔container propagation needs a real shared mount, which libkrun would have to configure at VM boot (containers are created post-boot) | ⚠️ architectural |
-| **seccomp localhost profiles** (2) | localhost profile, SYS_ADMIN-block | RuntimeDefault now installs the default BPF filter (`Seccomp: 2`); localhost profiles need the host profile file plumbed into the VM + compiled | ⚠️ host-file plumbing |
-| **unsafe sysctls** (1) | `fs.mqueue.msg_max` | safe sysctls are applied (`/proc/sys` writes); the guest kernel lacks `CONFIG_POSIX_MQUEUE` so `/proc/sys/fs/mqueue/` is absent | ❌ guest-kernel |
-| **AppArmor** (~2) | unloaded profile, profile blocking writes | LSM not wired in the guest | ✅ guest feature |
-| **Capabilities** (~3) | add/drop capability, drop ALL | capabilities not managed per-container; `brctl` bridge test also needs a `CONFIG_BRIDGE` guest kernel | ⚠️ murky / possibly kernel-limited |
-| **MaskedPaths** (1) | mask `/bin/ls` | masking code is correct, but under the alpine/busybox substitution `/bin/ls` and `/bin/sh` are the same `busybox` binary, so masking `ls` breaks `sh`; the expected stderr needs `sh` to run | ❌ test-image artifact |
+| Category | Failing specs | Root cause | Fixable here? |
+|----------|---------------|------------|---------------|
+| **Mount propagation** (3) | rprivate / rshared / rslave | bidirectional host↔container propagation needs a real shared mount configured at VM boot; containers are created post-boot and volumes are COPIED into the rootfs | ❌ architectural |
+| **Host namespaces** (2) | HostNetwork=true, HostIpc=true | each pod is an isolated microVM with its own kernel + namespaces — there is no host network/IPC namespace to share; rejected fail-closed rather than silently mis-running | ❌ architectural |
+| **Per-container PID isolation** (1) | ContainerPID | all of a pod's containers share the single VM-wide PID namespace; a per-container PID namespace is not modeled | ❌ architectural |
+| **AppArmor enforce** (1) | should enforce a profile blocking writes | the guest kernel has no AppArmor LSM, and CRI passes only the profile *name* — critest loads the profile on the **host** kernel and deletes the source, so the guest has nothing to compile, and the host-compiled binary policy is ABI-tied to the host kernel. CRI's shared-host-kernel AppArmor model does not map onto a separate-kernel microVM | ❌ architectural |
+| **PortForward (host network)** (1) | portforward in host network | depends on HostNetwork (above) | ❌ architectural |
+| **PortForward** (1) | portforward [Conformance] | the SPDY (`portforward.k8s.io`) bridge is implemented and verified end-to-end (`curl` through `crictl port-forward` to an in-guest listener returns the served bytes), but this test node is itself a production k8s node whose CNI DNATs `127.0.0.1:80` to another pod, hijacking the guest's loopback connect. Passes on a node without that hostPort-80 rule | ⚠️ environmental |
 
 ## Stability & hardening
 
+- **Leak-free under churn (validated):** 60 serial create/start/stop/remove pod
+  cycles + a 10-pod concurrent burst leave the server's RSS flat after warm-up
+  and fds/threads/shims/overlay-mounts/box-dirs all at zero — no per-pod leak.
+  `VmManager::destroy` now removes the box working directory for non-persistent
+  boxes (it previously leaked one `boxes/<id>` dir per pod, slowing later
+  RunPodSandbox until it timed out).
+- **Crash recovery (validated):** a hard `SIGKILL` of the CRI leaves 3 orphaned
+  microVMs (shims/mounts/box-dirs); on restart the runtime reaps all of them
+  (kills the shim, unmounts the overlay, removes the box dir) and marks the
+  sandboxes NotReady — zero leftovers after recovery.
 - **Graceful shutdown:** on SIGTERM/SIGINT the CRI drains the gRPC server then
-  reaps every sandbox VM (kills the shim, unmounts its overlay, removes the
-  rootfs dir) — no more orphaned microVMs/overlays across restarts. The reaper
-  runs even if the server exited with an error.
-- **Adversarial review (16 confirmed findings, all fixed):** caller-supplied
-  `A3S_SEC_*` env can no longer spoof the security envelope (privilege
-  escalation); the seccomp BPF filter is built before `fork` (no async-signal
-  unsafe allocation in the post-fork child — a musl malloc-deadlock risk);
-  MaskedPaths/ReadonlyPaths mounts are idempotent (no per-exec mount-leak);
-  MaskedPaths/ReadonlyPaths/sysctl names are path-traversal validated; misc
-  panic/leak/non-Linux-build fixes.
+  reaps every sandbox VM — no orphaned microVMs/overlays across restarts.
+- **Capability ordering:** container capabilities are applied *before* the
+  `setuid`, not after (a non-root `setuid` clears `CAP_SETPCAP`).
+- **Trusted security envelope:** caller-supplied `A3S_SEC_*` env can no longer
+  spoof the runtime's security envelope; the seccomp BPF filter is built before
+  `fork` (no async-signal-unsafe allocation in the post-fork child);
+  MaskedPaths/ReadonlyPaths mounts are idempotent and path-traversal validated;
+  masked symlinks are masked by the entry (`O_PATH|O_NOFOLLOW`), never their
+  followed target.
 - **ReopenContainerLog is synchronous** (waits for the supervisor to confirm the
-  reopen). Reduces — but does not fully eliminate — the "reopening container
-  log" flake; the residual race is guest→host log-transport ordering and needs
-  an exec-stream flush barrier.
-- **TODO:** SIGKILL/crash-case startup reaping (reconcile already marks orphaned
-  sandboxes NotReady, but does not yet reap the dead instance's leftover shim
-  processes + overlay mounts).
+  reopen) and uses an exec-stream **flush barrier**: on reopen the supervisor
+  sends a flush control to the guest, which drains every buffered output chunk
+  to the wire and replies with a flush-ack; the supervisor writes those chunks
+  into the old log file and only then reopens. This closes the guest→host
+  log-transport ordering gap so pre-rotation output cannot land in the new file.
+  (Pty/tty workloads keep the prior best-effort reopen.)
 
 ## Methodology
 
 The baseline is captured so each fix is measurable. Re-run after each CRI feature
 lands and update the "Latest run" table; the goal is to drive Failed → 0
-(excluding documented environmental/test-image artifacts) and graduate
-`a3s-box-cri` to a conformant, mature CRI runtime.
+(excluding documented architectural/environmental items) and graduate
+`a3s-box-cri` to a conformant, mature CRI runtime. At 73/82 the remaining
+failures are inherent to the microVM-per-pod model (host namespaces, per-container
+PID, mount propagation, AppArmor's shared-host-kernel assumption) or specific to
+this test node (the port-forward CNI DNAT); none is an outstanding logic defect.

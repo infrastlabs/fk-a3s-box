@@ -4,6 +4,216 @@ All notable changes to A3S Box will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Registry mirrors: `A3S_REGISTRY_MIRRORS=host=mirror,...` pulls image content
+  from a configured mirror while preserving the canonical image identity in the
+  store (e.g. fetch `registry.k8s.io`/`gcr.io` images via an accessible mirror).
+- CRI `SecurityContext.no_new_privs`: the guest sets `PR_SET_NO_NEW_PRIVS`
+  before exec, so a setuid/setgid or file-capability binary can no longer raise
+  the container process's privileges (privileged containers opt out).
+- CRI `SecurityContext.readonly_rootfs`: the guest remounts the container root
+  read-only before exec (writes to `/` fail), while `/proc`, `/sys`, and inner
+  mounts stay writable.
+- CRI pod DNS config: a pod's `DNSConfig` (servers, searches, options) is
+  captured on the sandbox and rendered into each container's `/etc/resolv.conf`
+  (falling back to the default when unset).
+- Image-defined supplemental groups: when a container runs as a specific user,
+  the guest applies the groups that user belongs to per the image's `/etc/group`
+  (runc-style initgroups) and defaults the primary gid to the user's
+  `/etc/passwd` group when no `RunAsGroup` is set.
+- `import` creates a single-layer image from a rootfs tarball (`.tar`/`.tar.gz`),
+  with Dockerfile-style `--change` directives (CMD/ENTRYPOINT/ENV/WORKDIR/USER/
+  EXPOSE/LABEL/VOLUME) and `--message` — matching `docker import`.
+- `images --filter` supports `reference=<glob>` and `label=<key>[=<value>]`
+  (repeatable; all must match), matching common `docker images --filter` usage.
+- `build --target <stage>` builds only up to the named (or indexed) stage of a
+  multi-stage build and emits that stage's image; later stages are not executed.
+- `build --no-cache` disables the layer build cache so every layer is rebuilt.
+- `inspect <name>` is now polymorphic: it resolves a container first, then falls
+  back to an image (matching `docker inspect`), instead of only handling boxes.
+- `ADD --chown=user[:group]` is now supported (was "not supported yet").
+- COPY/ADD `--chown` now also resolves named users/groups from the rootfs
+  `/etc/passwd`/`/etc/group`, not only numeric IDs.
+- `.dockerignore` support: a context-root `.dockerignore` now excludes matching
+  paths from `COPY`/`ADD` (comments, blank lines, `!` negation with last-match-
+  wins, and `?`/`*`/`**` globs). Previously `COPY . /app` copied everything —
+  `.git`, `node_modules`, `.env` secrets — into the image; those are now kept
+  out, matching Docker. (Applies to the build context, not `COPY --from`.)
+- Layer-level build cache (Docker/BuildKit-style): `a3s-box build` reuses
+  previously built layers across builds via a rolling chain key over each
+  instruction (and, for `COPY`/`ADD`, the content of the source files), so an
+  unchanged prefix is reused and a changed instruction/input rebuilds from that
+  layer on. Cached at `~/.a3s/buildcache`, size-capped (default 2 GiB,
+  `A3S_BOX_BUILDCACHE_MAX_BYTES`; oldest evicted first), best-effort.
+- CRI `ReopenContainerLog` flush boundary: log rotation now asks the guest to
+  flush and drains every buffered output chunk into the old log file (stopping
+  at a flush-ack marker added to the exec protocol) before reopening, so output
+  produced before the rotation cannot leak into the new file.
+- `network prune` removes all networks not used by at least one box, and
+  `system prune` now reaps unused networks too (matching `docker network prune`
+  and `docker system prune`). A network is kept while it has a live endpoint or
+  any box record (running or stopped) references it; predefined `bridge`/`host`/
+  `none` are never pruned.
+
+### Security
+- Host network/IPC namespaces are now rejected fail-closed: a pod or container
+  requesting `HostNetwork`/`HostIpc` (or a host user namespace) —
+  `NamespaceMode::NODE` — gets a clear `Unimplemented` error instead of being
+  silently run fully isolated. A microVM-per-pod has no host network or IPC
+  namespace inside the guest, so silently accepting gave the workload wrong
+  (fail-open) semantics. `HostPID` is accepted (the pod's shared VM-wide PID
+  namespace satisfies it), as are `POD`/`CONTAINER`.
+- AppArmor: a requested Localhost profile (modern `apparmor` SecurityProfile or
+  the deprecated `apparmor_profile` string) is now validated against the host's
+  loaded profiles and the container is rejected when the profile is not loaded,
+  instead of being silently ignored. The microVM cannot enforce an in-guest LSM
+  profile, so a loaded profile is accepted with a warning that it is not
+  enforced. Passes critest "should fail with an unloaded profile".
+- Non-privileged containers are now restricted to the runtime default
+  capability set (e.g. no `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`), adjusted by the
+  container's `add`/`drop` capabilities; privileged containers keep the full
+  set. Previously every container ran as full-capability root, so a
+  non-privileged container could perform privileged operations (e.g. create a
+  network bridge). The guest applies an exact keep-set via `capset` + bounding
+  drop before exec.
+
+### Added
+- Pod port reachability: a port mapping with only a container port now publishes
+  it on the same host port (Docker/containerd style), and a default (TSI) pod
+  that publishes ports reports `127.0.0.1` as its pod IP — TSI binds
+  `0.0.0.0:<port>` and forwards to the guest, so `podIP:<containerPort>` is
+  genuinely reachable from the node. Passes the port-mapping and
+  multi-container networking conformance specs. (Single-node reachability via
+  the node loopback; not a unique cluster-routable pod IP, and concurrent pods
+  publishing the same port still contend for the host port.)
+- Crash recovery: on startup the CRI reaps sandbox microVMs orphaned by a
+  previous crash/SIGKILL — it kills the leftover `a3s-box-shim` (matched by the
+  box id in its argv), unmounts its overlay, and removes its box directory —
+  instead of leaking the VM, mount, and disk across restarts. A graceful
+  shutdown already reaps VMs, so this is a no-op then.
+
+### Fixed
+- Docker build/runtime parity (found via a 51-case real-Linux probe):
+  - Build-time variable expansion now matches Docker: a later `ENV` value and
+    `WORKDIR` expand earlier `ENV`/`ARG` (e.g. `ENV APPDIR=/srv/app` then
+    `WORKDIR $APPDIR`), instead of keeping the literal `$APPDIR`. An undeclared
+    `--build-arg` (no matching `ARG`) is no longer substituted, and a global
+    pre-FROM `ARG` is now in scope for every stage's `FROM` and body (so
+    `FROM alpine:$BASETAG` in a later stage resolves).
+  - `COPY`/`ADD` expand wildcard sources (`COPY *.conf /etc/`) against the
+    build context instead of failing "source not found"; a glob matching
+    nothing errors like Docker. Remote `ADD` URLs are never globbed.
+  - `LABEL a=1 b=2 c=3` and `EXPOSE 80 443 8080/udp` on one line now parse every
+    item (previously LABEL merged into one key and EXPOSE kept only the first
+    port); bare EXPOSE ports normalize to `<port>/tcp`.
+  - `HEALTHCHECK --interval=1m30s` (Go compound durations) is accepted instead of
+    erroring "Invalid duration".
+  - `MAINTAINER` is accepted as deprecated-but-valid (builds, recorded as a
+    `maintainer` label) instead of failing the build.
+  - `--env-file` values are kept verbatim after the first `=` (Docker preserves
+    `PADDED=  x  `); previously the value was whitespace-trimmed.
+  - Runtime bare `-e KEY` (no `=`) copies `KEY` from the host environment
+    (Docker passthrough) instead of erroring; `--label`/`--log-opt` stay strict.
+- Short-lived `run` no longer stalls ~10s before returning. A container that
+  exits quickly (e.g. `run alpine -- echo hi`) made the VM halt and the shim
+  become a zombie; the boot-readiness wait checked liveness with `kill(pid,0)`,
+  which reports a zombie as alive, so it waited the full exec-heartbeat timeout
+  (~10s, intermittently, depending on a boot race). Readiness now uses a
+  zombie-aware liveness check (`/proc` state on Linux) and returns promptly
+  (~1.7s). Also speeds up the monitor restarting fast-exiting containers.
+- `run`/`create` health flags accept Docker-style duration strings:
+  `--health-interval 30s`, `--health-timeout 1m`, `--health-start-period 10s`
+  (and compounds like `1m30s`) instead of only a bare integer, which was
+  rejected with "invalid digit found in string". A bare number still means
+  seconds, so existing usage is unchanged. (The Dockerfile `HEALTHCHECK` and
+  compose-YAML paths already parsed durations.)
+- `RUN chmod` (mode-only changes) are now captured into the build layer, so
+  the common `COPY script.sh` + `RUN chmod +x script.sh` makes the script
+  executable in the image (previously the chmod was dropped and the script
+  could not be run as the entrypoint).
+- `--read-only` no longer crashes the container: a direct read-only remount of
+  the virtio-fs root can fail with EBUSY, which was fatal to init. It now falls
+  back to a bind-remount and, if that also fails, logs a warning and runs the
+  container writable instead of killing it.
+- Multi-variable `ENV KEY1=V1 KEY2=V2` (several pairs on one line) was parsed
+  as a single variable swallowing the rest (`KEY1="V1 KEY2=V2"`), so only the
+  first key got set and downstream `$KEY2` expanded empty. ENV now parses all
+  pairs (quote-aware, so `KEY="a b" K2=c` stays two vars). Single and legacy
+  `ENV KEY VALUE` forms are unchanged.
+- Image `USER` (named or numeric) and `run --user` are now applied to the
+  container MAIN process, by the guest init right before exec (setgroups +
+  setgid + setuid, after PID 1 finishes its root-only setup), reusing the same
+  resolver the exec path uses (names via the image /etc/passwd, image
+  supplementary groups). Previously this went through the shim's libkrun
+  set_uid, which dropped the guest PID 1 to that user and could not work at all:
+  a named USER was silently skipped (ran as root) and a numeric one crashed the
+  container. Now `USER appuser` runs the process as appuser.
+- `save`/`load` now round-trip the image tag: `save` stamps the image reference
+  into the OCI `index.json` `org.opencontainers.image.ref.name` annotation, so
+  `load` restores the tag (e.g. `rt:9`) instead of importing the image untagged
+  (by digest only). `load` already read the annotation; `save` never wrote it.
+- Image references with a purely numeric tag and no registry (`redis:7`,
+  `node:18`, `postgres:16`, `ubuntu:24`) were mis-parsed: the numeric tag was
+  treated as a registry port and dropped, so the reference resolved to the
+  `:latest` tag instead. A colon with no `/` is always a tag (a bare
+  `registry:port` with no repository is not a valid reference), so numeric tags
+  now parse correctly — affecting pull, run, and `images` display.
+- `COPY`/`ADD` now preserve symlinks instead of following them: a copied symlink
+  (e.g. a shared library `libfoo.so -> libfoo.so.1`, or any `node_modules`/
+  `/usr/lib` link) was dereferenced into a duplicate regular file, losing the
+  link and bloating the image. Symlinks (including symlink-to-dir and dangling
+  links) are now stored as symlink layer entries, matching Docker.
+- Multi-stage `COPY --from=<stage> /abs/path` (and any absolute COPY/ADD source)
+  was broken: the absolute source was resolved against the host root instead of
+  the source stage's rootfs (`Path::join` discards the base for an absolute
+  argument), failing with "source not found". Absolute sources are now resolved
+  relative to the context/stage, so multi-stage builds work.
+- Multi-layer image corruption in `a3s-box build`: layer digest and size were
+  computed before the gzip stream was flushed to disk (the tar builder owning
+  the encoder was dropped only at function end), so every layer recorded the
+  same digest — the hash of the partial 10-byte gzip header — and `size` 10.
+  Manifests referenced one wrong digest for every layer and the content-addressed
+  blob store collapsed all layers into the first; single-layer images happened
+  to round-trip, hiding the bug. The encoder is now finished before hashing.
+- Container `/dev` now contains the standard device nodes (`null`, `zero`,
+  `full`, `random`, `urandom`, `tty`), created in the guest before the container
+  starts. Workloads that need them — e.g. Apache httpd, which reads
+  `/dev/urandom` to seed its RNG and otherwise aborts with `AH00141` — now run.
+  Fixes the multi-container exec/log conformance specs.
+- The container log file is now created eagerly at `StartContainer` (instead of
+  lazily when the first output arrives), so a caller that opens the log
+  immediately after start — e.g. `ReopenContainerLog`, or before the container
+  has produced any output — finds it. Fixes the critest "reopening container
+  log" conformance spec.
+- CRI image identity now follows the digest, matching real runtimes:
+  - `ListImages`/`ImageStatus` coalesce references by content digest, so an
+    image with multiple tags appears once with all `repo_tags`.
+  - `ImageStatus` resolves an image by exact reference, image id (digest), a
+    `name@sha256:...` digest pin, or an unnormalized name (e.g. a tagless name
+    defaulting to `:latest`).
+  - `RemoveImage` accepts an image id (digest), not just a tag/reference.
+  - `PullImage` returns the content digest as `image_ref`, so different tags of
+    the same image dedupe to one image id.
+  - An image pulled by digest (`repo@sha256:...`) is reported with that
+    reference as a `repo_digest` and empty `repo_tags` (digest pins have no tag).
+  - `ImageStatus`/`ListImages` surface the image's configured user as `uid`
+    (numeric `uid`/`uid:gid`) or `username` (named user), from the OCI config.
+  - `CreateContainer` resolves the image the same way (exact ref, digest id,
+    `name@sha256:` pin, or unnormalized name), via a shared `ImageStore::resolve`
+    — so a container referencing an image by an untagged name now starts.
+  - The full critest Image Manager conformance suite now passes (7/7): public
+    image pull/remove by tag, without tag, and by digest; image status across
+    all reference kinds; non-empty uid/username; and the listImage image and
+    repoTag counts.
+- `stop` now stops containers gracefully and honors the image `STOPSIGNAL`. The
+  CLI signalled the shim directly, but libkrun renames the shim and a host
+  signal kills the VM abruptly, so the container never ran its stop handler —
+  a `STOPSIGNAL SIGINT` image, or even a plain SIGTERM trap, was ignored. The
+  stop signal is now delivered inside the guest over the exec channel (a
+  `signal-main` control to the container's main process); the container runs its
+  own shutdown and exits, then guest init exits and the VM halts cleanly. A
+  container that ignores the signal is still force-killed at the stop timeout.
+
 ## [2.0.6] — 2026-06-01
 
 ### Added

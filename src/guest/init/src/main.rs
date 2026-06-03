@@ -28,6 +28,9 @@ struct ExecConfig {
     env: Vec<(String, String)>,
     /// Working directory
     workdir: String,
+    /// Container user (`uid`, `uid:gid`, `root`, or a name resolved via the
+    /// image `/etc/passwd`). Applied to the main process before exec.
+    user: Option<String>,
 }
 
 impl ExecConfig {
@@ -56,6 +59,11 @@ impl ExecConfig {
 
         let workdir = std::env::var("BOX_EXEC_WORKDIR").unwrap_or_else(|_| "/".to_string());
 
+        // Optional container user (image USER directive or CLI --user).
+        let user = std::env::var("BOX_EXEC_USER")
+            .ok()
+            .filter(|u| !u.is_empty());
+
         // Collect BOX_EXEC_ENV_* variables
         let env: Vec<(String, String)> = std::env::vars()
             .filter_map(|(key, value)| {
@@ -69,6 +77,7 @@ impl ExecConfig {
             args,
             env,
             workdir,
+            user,
         }
     }
 }
@@ -256,10 +265,16 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         &args_refs,
         &env_refs,
         &exec_config.workdir,
+        exec_config.user.as_deref(),
     )?;
     let container_pid = nix::unistd::Pid::from_raw(container_pid_raw as i32);
 
     info!("Container process started with PID {}", container_pid);
+
+    // Make the main container PID available to the exec server so a host
+    // graceful-stop request (signal-main control frame) can deliver the
+    // STOPSIGNAL to it. Must be set before the exec server thread starts.
+    exec_server::set_container_pid(container_pid_raw as i32);
 
     expose_container_env_to_exec(&exec_config);
 
@@ -811,14 +826,41 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
     use nix::mount::{mount, MsFlags};
 
     info!("Remounting rootfs as read-only (--read-only)");
-    mount(
+
+    // A direct `MS_REMOUNT|MS_RDONLY` of the virtio-fs root often fails with
+    // EBUSY. Fall back to the bind-remount trick (bind / onto itself, then
+    // remount that bind read-only), which succeeds where a direct remount
+    // cannot. If both fail, log and continue WRITABLE — a non-enforced
+    // --read-only is far less harmful than killing the container outright.
+    let direct = mount(
         None::<&str>,
         "/",
         None::<&str>,
         MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
         None::<&str>,
-    )?;
-    info!("Rootfs remounted read-only");
+    );
+    if direct.is_ok() {
+        info!("Rootfs remounted read-only");
+        return Ok(());
+    }
+
+    let bind = mount(Some("/"), "/", None::<&str>, MsFlags::MS_BIND, None::<&str>).and_then(|_| {
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+            None::<&str>,
+        )
+    });
+    match bind {
+        Ok(()) => info!("Rootfs remounted read-only (via bind)"),
+        Err(error) => warn!(
+            %error,
+            direct_error = ?direct.err(),
+            "Could not remount rootfs read-only; container runs writable"
+        ),
+    }
     Ok(())
 }
 

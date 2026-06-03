@@ -91,6 +91,11 @@ impl VmManager {
         // Determine whether guest init is installed (it becomes PID 1 and passes
         // BOX_EXEC_* env vars to the container entrypoint).
         let guest_init_exec = Self::guest_init_exec_path(&layout.rootfs_path);
+        // When guest init is PID 1 it applies the container user to the main
+        // process itself (via BOX_EXEC_USER below); the shim must then NOT call
+        // libkrun set_uid (which would drop PID 1 and break init). Only the
+        // legacy no-guest-init path falls back to the shim's set_uid.
+        let has_guest_init = guest_init_exec.is_some();
         let workdir = Self::effective_workdir(&self.config, layout.oci_config.as_ref());
         let user = Self::effective_user(&self.config, layout.oci_config.as_ref());
 
@@ -130,6 +135,15 @@ impl VmManager {
             // Pass the effective working directory to guest init so PID 1 and
             // the container entrypoint agree even when no OCI WORKDIR is set.
             env.push(("BOX_EXEC_WORKDIR".to_string(), workdir.clone()));
+
+            // Pass the container user (image USER / --user) to guest init, which
+            // applies it (setgroups+setgid+setuid) to the MAIN process right
+            // before exec — after PID 1 has done its root-only setup. This must
+            // NOT go through the shim's libkrun set_uid, which would drop guest
+            // PID 1 to the user and break init (mount/chroot need root).
+            if let Some(user) = &user {
+                env.push(("BOX_EXEC_USER".to_string(), user.clone()));
+            }
 
             // Pass container environment variables with BOX_EXEC_ENV_ prefix
             for (key, value) in container_env {
@@ -303,7 +317,9 @@ impl VmManager {
             workdir,
             tee_config: layout.tee_instance_config.clone(),
             port_map: self.config.port_map.clone(),
-            user,
+            // Guest init applies the user to the main process (BOX_EXEC_USER);
+            // only the legacy no-guest-init path uses the shim's set_uid.
+            user: if has_guest_init { None } else { user },
             network: None, // Network config is set by CLI when --network is specified
             resource_limits: self.config.resource_limits.clone(),
         })
@@ -875,7 +891,14 @@ mod tests {
         let spec = vm.build_instance_spec(&layout).unwrap();
 
         assert_eq!(spec.workdir, "/override");
-        assert_eq!(spec.user.as_deref(), Some("1000:1000"));
+        // With guest init present, the user is applied by the guest (via
+        // BOX_EXEC_USER), not the shim's set_uid — so spec.user is None.
+        assert_eq!(spec.user, None);
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_EXEC_USER" && value == "1000:1000"));
         assert!(spec
             .entrypoint
             .env
@@ -896,7 +919,12 @@ mod tests {
         let spec = vm.build_instance_spec(&layout).unwrap();
 
         assert_eq!(spec.workdir, "/oci");
-        assert_eq!(spec.user.as_deref(), Some("2000:2000"));
+        assert_eq!(spec.user, None);
+        assert!(spec
+            .entrypoint
+            .env
+            .iter()
+            .any(|(key, value)| key == "BOX_EXEC_USER" && value == "2000:2000"));
         assert!(spec
             .entrypoint
             .env

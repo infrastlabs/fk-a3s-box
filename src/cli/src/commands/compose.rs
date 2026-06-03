@@ -777,7 +777,12 @@ async fn stop_service_process(svc: &ServiceBox) {
         .map(a3s_box_core::vmm::parse_signal_name)
         .unwrap_or(libc::SIGTERM);
     let stop_timeout = svc.stop_timeout.unwrap_or(10);
-    crate::process::graceful_stop(pid, stop_signal, stop_timeout).await;
+    let exec_socket = if svc.exec_socket_path.as_os_str().is_empty() {
+        svc.box_dir.join("sockets").join("exec.sock")
+    } else {
+        svc.exec_socket_path.clone()
+    };
+    crate::process::graceful_stop_via_guest(pid, &exec_socket, stop_signal, stop_timeout).await;
 }
 
 fn cleanup_created_networks(created_networks: &[String]) {
