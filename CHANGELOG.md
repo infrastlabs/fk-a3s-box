@@ -93,6 +93,12 @@ All notable changes to A3S Box will be documented in this file.
   shutdown already reaps VMs, so this is a no-op then.
 
 ### Fixed
+- `run`/`create` health flags accept Docker-style duration strings:
+  `--health-interval 30s`, `--health-timeout 1m`, `--health-start-period 10s`
+  (and compounds like `1m30s`) instead of only a bare integer, which was
+  rejected with "invalid digit found in string". A bare number still means
+  seconds, so existing usage is unchanged. (The Dockerfile `HEALTHCHECK` and
+  compose-YAML paths already parsed durations.)
 - `RUN chmod` (mode-only changes) are now captured into the build layer, so
   the common `COPY script.sh` + `RUN chmod +x script.sh` makes the script
   executable in the image (previously the chmod was dropped and the script
