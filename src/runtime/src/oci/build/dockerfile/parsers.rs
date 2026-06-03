@@ -52,7 +52,7 @@ pub(super) fn parse_copy(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    let (from, remaining) = parse_copy_flags(rest, line_num)?;
+    let (from, chown, remaining) = parse_copy_flags(rest, line_num)?;
     if remaining.starts_with('[') {
         return Err(BoxError::BuildError(format!(
             "Line {}: COPY JSON array form is not supported yet",
@@ -69,14 +69,13 @@ pub(super) fn parse_copy(rest: &str, line_num: usize) -> Result<Instruction> {
         )));
     }
 
-    // parts.len() >= 2 guaranteed by the check above
     let dst = parts[parts.len() - 1].to_string();
     let src: Vec<String> = parts[..parts.len() - 1]
         .iter()
         .map(|s| s.to_string())
         .collect();
 
-    Ok(Instruction::Copy { src, dst, from })
+    Ok(Instruction::Copy { src, dst, from, chown })
 }
 
 pub(super) fn parse_workdir(rest: &str, line_num: usize) -> Result<Instruction> {
@@ -457,14 +456,16 @@ pub(super) fn parse_volume(rest: &str, line_num: usize) -> Result<Instruction> {
     Ok(Instruction::Volume { paths })
 }
 
-fn parse_copy_flags(rest: &str, line_num: usize) -> Result<(Option<String>, &str)> {
+/// Returns `(from, chown, remaining_args)`.
+fn parse_copy_flags(rest: &str, line_num: usize) -> Result<(Option<String>, Option<String>, &str)> {
     let mut from = None;
+    let mut chown = None;
     let mut remaining = rest;
 
     loop {
         let trimmed = remaining.trim_start();
         if !trimmed.starts_with("--") {
-            return Ok((from, trimmed));
+            return Ok((from, chown, trimmed));
         }
 
         let (flag, after) = split_first_word(trimmed);
@@ -484,9 +485,14 @@ fn parse_copy_flags(rest: &str, line_num: usize) -> Result<(Option<String>, &str
             remaining = after;
             continue;
         }
+        if let Some(owner) = flag.strip_prefix("--chown=") {
+            chown = Some(owner.to_string());
+            remaining = after;
+            continue;
+        }
 
         return Err(BoxError::BuildError(format!(
-            "Line {}: COPY flag '{}' is not supported yet (supported: --from=<stage>)",
+            "Line {}: COPY flag '{}' is not supported (supported: --from=<stage>, --chown=user[:group])",
             line_num, flag
         )));
     }

@@ -130,10 +130,23 @@ fn walk_dir(root: &Path, current: &Path, entries: &mut HashMap<PathBuf, FileEntr
 /// Create a tar.gz layer from a list of changed files in a rootfs.
 ///
 /// Returns the path to the created layer file and its SHA256 digest.
+/// When `chown` is `Some((uid, gid))`, all tar entry headers are stamped with
+/// that uid/gid (regardless of the host filesystem owner), which is how Docker
+/// implements `COPY --chown` without requiring elevated permissions.
 pub fn create_layer(
     rootfs: &Path,
     changed_files: &[PathBuf],
     output_path: &Path,
+) -> Result<LayerInfo> {
+    create_layer_with_chown(rootfs, changed_files, output_path, None)
+}
+
+/// Internal: `create_layer` with optional uid/gid override for tar headers.
+pub(super) fn create_layer_with_chown(
+    rootfs: &Path,
+    changed_files: &[PathBuf],
+    output_path: &Path,
+    chown: Option<(u32, u32)>,
 ) -> Result<LayerInfo> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -161,23 +174,9 @@ pub fn create_layer(
         };
 
         if meta.is_dir() {
-            builder.append_dir(relative_path, &full_path).map_err(|e| {
-                BoxError::BuildError(format!(
-                    "Failed to add directory {} to layer: {}",
-                    relative_path.display(),
-                    e
-                ))
-            })?;
+            append_dir_with_chown(&mut builder, relative_path, &full_path, chown)?;
         } else {
-            builder
-                .append_path_with_name(&full_path, relative_path)
-                .map_err(|e| {
-                    BoxError::BuildError(format!(
-                        "Failed to add file {} to layer: {}",
-                        relative_path.display(),
-                        e
-                    ))
-                })?;
+            append_file_with_chown(&mut builder, relative_path, &full_path, &meta, chown)?;
         }
     }
 
@@ -214,6 +213,16 @@ pub fn create_layer_from_dir(
     target_prefix: &Path,
     output_path: &Path,
 ) -> Result<LayerInfo> {
+    create_layer_from_dir_with_chown(src_dir, target_prefix, output_path, None)
+}
+
+/// Internal: `create_layer_from_dir` with optional uid/gid override.
+pub(super) fn create_layer_from_dir_with_chown(
+    src_dir: &Path,
+    target_prefix: &Path,
+    output_path: &Path,
+    chown: Option<(u32, u32)>,
+) -> Result<LayerInfo> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
 
@@ -230,7 +239,7 @@ pub fn create_layer_from_dir(
     // Preserve symlinks as symlink entries instead of copying their targets.
     builder.follow_symlinks(false);
 
-    add_dir_to_tar(&mut builder, src_dir, src_dir, target_prefix)?;
+    add_dir_to_tar(&mut builder, src_dir, src_dir, target_prefix, chown)?;
 
     // Finish the tar AND flush the gzip stream to disk before hashing (see
     // `create_layer` for why hashing before the gzip flush is incorrect).
@@ -257,6 +266,7 @@ fn add_dir_to_tar<W: std::io::Write>(
     root: &Path,
     current: &Path,
     target_prefix: &Path,
+    chown: Option<(u32, u32)>,
 ) -> Result<()> {
     let entries = std::fs::read_dir(current).map_err(|e| {
         BoxError::BuildError(format!(
@@ -281,20 +291,81 @@ fn add_dir_to_tar<W: std::io::Write>(
         let file_type = entry
             .file_type()
             .map_err(|e| BoxError::BuildError(format!("Failed to stat entry: {}", e)))?;
+        let meta = entry
+            .metadata()
+            .map_err(|e| BoxError::BuildError(format!("Failed to stat entry: {}", e)))?;
 
         if file_type.is_dir() {
-            builder.append_dir(&tar_path, &path).map_err(|e| {
-                BoxError::BuildError(format!("Failed to add directory to layer: {}", e))
-            })?;
-            add_dir_to_tar(builder, root, &path, target_prefix)?;
+            append_dir_with_chown(builder, &tar_path, &path, chown)?;
+            add_dir_to_tar(builder, root, &path, target_prefix, chown)?;
         } else {
-            builder
-                .append_path_with_name(&path, &tar_path)
-                .map_err(|e| BoxError::BuildError(format!("Failed to add file to layer: {}", e)))?;
+            append_file_with_chown(builder, &tar_path, &path, &meta, chown)?;
         }
     }
 
     Ok(())
+}
+
+/// Append a directory entry, overriding uid/gid when `chown` is set.
+fn append_dir_with_chown<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    tar_path: &Path,
+    dir_path: &Path,
+    chown: Option<(u32, u32)>,
+) -> Result<()> {
+    if let Some((uid, gid)) = chown {
+        let mut header = tar::Header::new_gnu();
+        let meta = std::fs::symlink_metadata(dir_path)
+            .map_err(|e| BoxError::BuildError(format!("Failed to stat {}: {}", dir_path.display(), e)))?;
+        header.set_metadata_in_mode(&meta, tar::HeaderMode::Complete);
+        header.set_uid(uid as u64);
+        header.set_gid(gid as u64);
+        header.set_username("").ok();
+        header.set_groupname("").ok();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, tar_path, std::io::empty())
+            .map_err(|e| BoxError::BuildError(format!("Failed to add dir to layer: {}", e)))
+    } else {
+        builder
+            .append_dir(tar_path, dir_path)
+            .map_err(|e| BoxError::BuildError(format!("Failed to add directory to layer: {}", e)))
+    }
+}
+
+/// Append a file/symlink entry, overriding uid/gid when `chown` is set.
+fn append_file_with_chown<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    tar_path: &Path,
+    file_path: &Path,
+    meta: &std::fs::Metadata,
+    chown: Option<(u32, u32)>,
+) -> Result<()> {
+    if let Some((uid, gid)) = chown {
+        let mut header = tar::Header::new_gnu();
+        header.set_metadata_in_mode(meta, tar::HeaderMode::Complete);
+        header.set_uid(uid as u64);
+        header.set_gid(gid as u64);
+        header.set_username("").ok();
+        header.set_groupname("").ok();
+        header.set_cksum();
+        // For symlinks, the data is empty (target is in link_name header field).
+        let body: Box<dyn std::io::Read> = if meta.file_type().is_symlink() {
+            Box::new(std::io::empty())
+        } else {
+            Box::new(
+                std::fs::File::open(file_path)
+                    .map_err(|e| BoxError::BuildError(format!("Failed to open {}: {}", file_path.display(), e)))?,
+            )
+        };
+        builder
+            .append_data(&mut header, tar_path, body)
+            .map_err(|e| BoxError::BuildError(format!("Failed to add file to layer: {}", e)))
+    } else {
+        builder
+            .append_path_with_name(file_path, tar_path)
+            .map_err(|e| BoxError::BuildError(format!("Failed to add file to layer: {}", e)))
+    }
 }
 
 /// Information about a created layer.

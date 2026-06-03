@@ -241,6 +241,81 @@ fn symlink_to(target: &Path, link: &Path) -> Result<()> {
 }
 
 /// Format a byte size as a human-readable string.
+/// Parse a `--chown` value (`user[:group]`, numeric or named) into a
+/// `(uid, gid)` pair. Named users/groups are resolved from the base image's
+/// `/etc/passwd` and `/etc/group` inside `rootfs_dir`.
+pub(super) fn resolve_chown(spec: &str, rootfs_dir: &Path) -> Result<(u32, u32)> {
+    let (user_part, group_part) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+
+    let uid = resolve_user(user_part, rootfs_dir)?;
+    let gid = match group_part {
+        Some(g) => resolve_group(g, rootfs_dir)?,
+        None => uid_to_gid(uid, rootfs_dir).unwrap_or(uid),
+    };
+    Ok((uid, gid))
+}
+
+fn resolve_user(user: &str, rootfs: &Path) -> Result<u32> {
+    if let Ok(n) = user.parse::<u32>() {
+        return Ok(n);
+    }
+    // Look up in rootfs /etc/passwd: root:x:0:0:...
+    let passwd = std::fs::read_to_string(rootfs.join("etc/passwd")).unwrap_or_default();
+    for line in passwd.lines() {
+        let f: Vec<&str> = line.splitn(4, ':').collect();
+        if f.len() >= 3 && f[0] == user {
+            return f[2].parse::<u32>().map_err(|_| {
+                BoxError::BuildError(format!("Invalid UID for user '{}' in /etc/passwd", user))
+            });
+        }
+    }
+    Err(BoxError::BuildError(format!(
+        "COPY --chown: user '{}' not found in rootfs /etc/passwd",
+        user
+    )))
+}
+
+fn resolve_group(group: &str, rootfs: &Path) -> Result<u32> {
+    if let Ok(n) = group.parse::<u32>() {
+        return Ok(n);
+    }
+    let etc_group = std::fs::read_to_string(rootfs.join("etc/group")).unwrap_or_default();
+    for line in etc_group.lines() {
+        let f: Vec<&str> = line.splitn(4, ':').collect();
+        if f.len() >= 3 && f[0] == group {
+            return f[2].parse::<u32>().map_err(|_| {
+                BoxError::BuildError(format!("Invalid GID for group '{}' in /etc/group", group))
+            });
+        }
+    }
+    Err(BoxError::BuildError(format!(
+        "COPY --chown: group '{}' not found in rootfs /etc/group",
+        group
+    )))
+}
+
+/// Get the primary GID for a UID from /etc/passwd (field 4).
+fn uid_to_gid(uid: u32, rootfs: &Path) -> Option<u32> {
+    let passwd = std::fs::read_to_string(rootfs.join("etc/passwd")).ok()?;
+    for line in passwd.lines() {
+        let f: Vec<&str> = line.splitn(5, ':').collect();
+        if f.len() >= 4 && f[2].parse::<u32>().ok() == Some(uid) {
+            return f[3].parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+/// Placeholder — no longer used; chown is applied in tar headers, not the
+/// host filesystem.
+#[allow(dead_code)]
+pub(super) fn apply_chown_recursive(_dir: &Path, _uid: u32, _gid: u32) -> Result<()> {
+    Ok(())
+}
+
 pub(super) fn format_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 * 1024 {
         format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))

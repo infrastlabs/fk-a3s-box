@@ -101,6 +101,7 @@ mod tests {
                 src: vec!["app.py".to_string()],
                 dst: "/workspace/".to_string(),
                 from: None,
+                chown: None,
             }
         );
     }
@@ -114,6 +115,7 @@ mod tests {
                 src: vec!["file1.txt".to_string(), "file2.txt".to_string()],
                 dst: "/dest/".to_string(),
                 from: None,
+                chown: None,
             }
         );
     }
@@ -127,16 +129,43 @@ mod tests {
                 src: vec!["/app/bin".to_string()],
                 dst: "/usr/local/bin/".to_string(),
                 from: Some("builder".to_string()),
+                chown: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_chown() {
+        let result = parsers::parse_copy("--chown=1000:1000 app.py /workspace/", 1).unwrap();
+        assert_eq!(
+            result,
+            Instruction::Copy {
+                src: vec!["app.py".to_string()],
+                dst: "/workspace/".to_string(),
+                from: None,
+                chown: Some("1000:1000".to_string()),
+            }
+        );
+        // Named user only
+        let r2 = parsers::parse_copy("--chown=node app.js /app/", 1).unwrap();
+        assert_eq!(
+            r2,
+            Instruction::Copy {
+                src: vec!["app.js".to_string()],
+                dst: "/app/".to_string(),
+                from: None,
+                chown: Some("node".to_string()),
             }
         );
     }
 
     #[test]
     fn test_parse_copy_rejects_unsupported_flag() {
-        let err = parsers::parse_copy("--chown=1000:1000 app.py /workspace/", 1)
+        // --link is not a supported flag
+        let err = parsers::parse_copy("--link app.py /workspace/", 1)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("COPY flag '--chown=1000:1000' is not supported yet"));
+        assert!(err.contains("COPY flag '--link' is not supported"));
     }
 
     #[test]
@@ -703,6 +732,7 @@ CMD ["app.py"]
                     src: vec![".".to_string()],
                     dst: "/app".to_string(),
                     from: None,
+                    chown: None,
                 }),
             }
         );

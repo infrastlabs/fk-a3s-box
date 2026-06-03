@@ -6,9 +6,13 @@ use a3s_box_core::error::{BoxError, Result};
 
 use super::super::dockerfile::Instruction;
 use super::super::dockerignore::DockerIgnore;
-use super::super::layer::{create_layer, create_layer_from_dir, LayerInfo};
+use super::super::layer::{
+    create_layer, create_layer_from_dir, create_layer_from_dir_with_chown,
+    create_layer_with_chown, LayerInfo,
+};
 use super::utils::{
-    copy_dir_filtered, expand_args, extract_tar_to_dst, is_tar_archive, resolve_path,
+    copy_dir_filtered, expand_args, extract_tar_to_dst, is_tar_archive, resolve_chown,
+    resolve_path,
 };
 use super::BuildState;
 
@@ -20,6 +24,7 @@ const UNSAFE_HOST_RUN_ENV: &str = "A3S_BOX_UNSAFE_HOST_RUN";
 pub(super) fn handle_copy(
     src_patterns: &[String],
     dst: &str,
+    chown: Option<&str>,
     context_dir: &Path,
     rootfs_dir: &Path,
     layers_dir: &Path,
@@ -97,22 +102,26 @@ pub(super) fn handle_copy(
         }
     }
 
-    // Create a layer from the copied files
-    // We use create_layer_from_dir approach: snapshot the destination
-    let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
+    // Resolve --chown uid/gid (header-level, no host filesystem ownership change
+    // required — Docker BuildKit sets tar headers rather than calling chown).
+    let chown_ids = if let Some(spec) = chown {
+        Some(resolve_chown(spec, rootfs_dir)?)
+    } else {
+        None
+    };
 
-    // For COPY, create a layer containing just the destination files
+    // Create a layer from the copied files
+    let layer_path = layers_dir.join(format!("layer_{}.tar.gz", layer_index));
     let target_prefix = Path::new(resolved_dst.trim_start_matches('/'));
     if dst_in_rootfs.is_dir() {
-        create_layer_from_dir(&dst_in_rootfs, target_prefix, &layer_path)
+        create_layer_from_dir_with_chown(&dst_in_rootfs, target_prefix, &layer_path, chown_ids)
     } else if dst_in_rootfs.parent().is_some() {
-        // Single file copy: create layer with just that file
         let changed = vec![PathBuf::from(
             dst_in_rootfs
                 .strip_prefix(rootfs_dir)
                 .unwrap_or(target_prefix),
         )];
-        create_layer(rootfs_dir, &changed, &layer_path)
+        create_layer_with_chown(rootfs_dir, &changed, &layer_path, chown_ids)
     } else {
         Err(BoxError::BuildError("Invalid COPY destination".to_string()))
     }
@@ -605,12 +614,15 @@ pub(super) fn execute_onbuild_trigger(
 pub(super) fn instruction_to_string(instr: &Instruction) -> String {
     match instr {
         Instruction::Run { command } => format!("RUN {}", command),
-        Instruction::Copy { src, dst, from } => {
+        Instruction::Copy { src, dst, from, chown } => {
+            let mut prefix = String::from("COPY");
             if let Some(f) = from {
-                format!("COPY --from={} {} {}", f, src.join(" "), dst)
-            } else {
-                format!("COPY {} {}", src.join(" "), dst)
+                prefix.push_str(&format!(" --from={}", f));
             }
+            if let Some(c) = chown {
+                prefix.push_str(&format!(" --chown={}", c));
+            }
+            format!("{} {} {}", prefix, src.join(" "), dst)
         }
         Instruction::Add { src, dst, chown } => {
             if let Some(c) = chown {
@@ -739,6 +751,7 @@ mod tests {
             src: vec!["file1.txt".to_string(), "file2.txt".to_string()],
             dst: "/app/".to_string(),
             from: None,
+            chown: None,
         };
         assert_eq!(
             instruction_to_string(&instr),
@@ -752,6 +765,7 @@ mod tests {
             src: vec!["app".to_string()],
             dst: "/usr/local/bin/".to_string(),
             from: Some("builder".to_string()),
+            chown: None,
         };
         assert_eq!(
             instruction_to_string(&instr),

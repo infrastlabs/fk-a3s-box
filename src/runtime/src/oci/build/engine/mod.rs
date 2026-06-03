@@ -304,9 +304,11 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                     });
                 }
 
-                Instruction::Copy { src, dst, from } => {
+                Instruction::Copy { src, dst, from, chown } => {
                     let created_by = if let Some(from_ref) = from {
                         format!("COPY --from={} {} {}", from_ref, src.join(" "), dst)
+                    } else if let Some(owner) = chown {
+                        format!("COPY --chown={} {} {}", owner, src.join(" "), dst)
                     } else {
                         format!("COPY {} {}", src.join(" "), dst)
                     };
@@ -347,6 +349,7 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                         let layer_info = handle_copy(
                             src,
                             dst,
+                            chown.as_deref(),
                             from_rootfs,
                             &rootfs_dir,
                             &layers_dir,
@@ -382,6 +385,7 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                         let layer_info = handle_copy(
                             src,
                             dst,
+                            chown.as_deref(),
                             &config.context_dir,
                             &rootfs_dir,
                             &layers_dir,

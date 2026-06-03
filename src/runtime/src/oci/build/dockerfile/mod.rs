@@ -20,11 +20,13 @@ pub enum Instruction {
     },
     /// `RUN <command>` (shell form)
     Run { command: String },
-    /// `COPY [--from=<stage>] <src>... <dst>`
+    /// `COPY [--from=<stage>] [--chown=user[:group]] <src>... <dst>`
     Copy {
         src: Vec<String>,
         dst: String,
         from: Option<String>,
+        /// Owner to apply to copied files (`user[:group]`, numeric or named).
+        chown: Option<String>,
     },
     /// `WORKDIR <path>`
     Workdir { path: String },
