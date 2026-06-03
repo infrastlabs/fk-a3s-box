@@ -6,6 +6,7 @@
 
 use std::io::Read;
 use std::io::Write;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -17,6 +18,43 @@ use a3s_transport::FrameType;
 use tracing::{info, warn};
 
 use crate::user::{parse_process_user, ProcessUser};
+
+/// PID of the main container process (the entrypoint spawned by guest init).
+/// Set by `main` after spawn so the exec server can deliver a graceful stop
+/// signal to it on a host shutdown request. -1 until known.
+static CONTAINER_PID: AtomicI32 = AtomicI32::new(-1);
+
+/// Record the main container PID for graceful-shutdown signal delivery.
+pub fn set_container_pid(pid: i32) {
+    CONTAINER_PID.store(pid, Ordering::SeqCst);
+}
+
+/// Host→guest control to gracefully stop the container: deliver the given signal
+/// number to the main container process. `signal-main:<N>` (e.g. `signal-main:15`
+/// for SIGTERM, `signal-main:2` for the image STOPSIGNAL=SIGINT). The container
+/// then runs its own shutdown; when it exits, guest init exits and the VM stops.
+/// Must match the host's prefix in `runtime/src/grpc/exec.rs`.
+#[cfg(target_os = "linux")]
+const EXEC_CONTROL_SIGNAL_MAIN: &[u8] = b"signal-main:";
+#[cfg(target_os = "linux")]
+const EXEC_SIGNAL_MAIN_ACK: &[u8] = b"signal-main-ack";
+
+/// Deliver `sig` to the main container process (best-effort).
+#[cfg(target_os = "linux")]
+fn signal_main_process(sig: i32) {
+    let pid = CONTAINER_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        info!(
+            pid,
+            sig, "Delivering graceful stop signal to container main process"
+        );
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    } else {
+        warn!(sig, "Graceful stop requested but container PID is unknown");
+    }
+}
 
 /// Maximum payload bytes per streamed exec chunk.
 const STREAM_CHUNK_BYTES: usize = 16 * 1024;
@@ -121,6 +159,18 @@ fn handle_connection(fd: std::os::fd::OwnedFd) -> Result<(), Box<dyn std::error:
         // Heartbeat: respond with Heartbeat frame (health check)
         if frame_type == FrameType::Heartbeat as u8 {
             write_frame(&mut stream, FrameType::Heartbeat as u8, &payload)?;
+            std::mem::forget(fd);
+            return Ok(());
+        }
+        // Graceful-stop control: deliver a signal to the container main process.
+        if frame_type == FrameType::Control as u8 && payload.starts_with(EXEC_CONTROL_SIGNAL_MAIN) {
+            let sig = std::str::from_utf8(&payload[EXEC_CONTROL_SIGNAL_MAIN.len()..])
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .filter(|n| *n > 0 && *n < 64)
+                .unwrap_or(libc::SIGTERM);
+            signal_main_process(sig);
+            write_frame(&mut stream, FrameType::Control as u8, EXEC_SIGNAL_MAIN_ACK)?;
             std::mem::forget(fd);
             return Ok(());
         }

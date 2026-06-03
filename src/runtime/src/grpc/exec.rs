@@ -16,6 +16,10 @@ const EXEC_CONTROL_FLUSH: &[u8] = b"flush";
 /// distinct from an `ExecExit` JSON payload so `next_event` can tell them apart.
 /// Must match the guest's `EXEC_FLUSH_ACK` in `guest/init/src/exec_server.rs`.
 const EXEC_FLUSH_ACK: &[u8] = b"flush-ack";
+/// Guest→host acknowledgement that a `signal-main:<N>` graceful-stop control was
+/// received and the signal delivered. Must match the guest's
+/// `EXEC_SIGNAL_MAIN_ACK` in `guest/init/src/exec_server.rs`.
+const EXEC_SIGNAL_MAIN_ACK: &[u8] = b"signal-main-ack";
 
 type ExecFrameReader = a3s_transport::FrameReader<tokio::io::ReadHalf<tokio::net::UnixStream>>;
 type ExecFrameWriter = a3s_transport::FrameWriter<tokio::io::WriteHalf<tokio::net::UnixStream>>;
@@ -234,6 +238,40 @@ impl ExecClient {
         let mut reader = a3s_transport::FrameReader::new(r);
         match reader.read_frame().await {
             Ok(Some(f)) if f.frame_type == a3s_transport::FrameType::Heartbeat => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    /// Ask the guest to deliver `signal` (a signal number, e.g. 15 for SIGTERM)
+    /// to the main container process for graceful shutdown. The guest runs the
+    /// container's own stop handler; when it exits, guest init exits and the VM
+    /// stops cleanly. Returns `Ok(true)` if the guest acknowledged, `Ok(false)`
+    /// if it did not respond (caller should fall back to a hard stop).
+    pub async fn signal_main(&self, signal: i32) -> Result<bool> {
+        let mut stream = match UnixStream::connect(&self.socket_path).await {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+
+        let payload = format!("signal-main:{}", signal).into_bytes();
+        let frame = a3s_transport::Frame::control(payload);
+        let encoded = frame
+            .encode()
+            .map_err(|e| BoxError::ExecError(format!("signal-main frame encode failed: {}", e)))?;
+
+        if stream.write_all(&encoded).await.is_err() {
+            return Ok(false);
+        }
+
+        let (r, _w) = tokio::io::split(stream);
+        let mut reader = a3s_transport::FrameReader::new(r);
+        match reader.read_frame().await {
+            Ok(Some(f))
+                if f.frame_type == a3s_transport::FrameType::Control
+                    && f.payload == EXEC_SIGNAL_MAIN_ACK =>
+            {
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -584,6 +622,50 @@ mod tests {
         };
         let result = client.heartbeat().await.unwrap();
         assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_exec_signal_main_round_trip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("signal_main.sock");
+        let Some(listener) = bind_test_listener(&sock_path) else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            // Accept connect verification
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+            // Accept signal-main connection: read the Control frame, ack it.
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, w) = tokio::io::split(stream);
+            let mut reader = a3s_transport::FrameReader::new(r);
+            let mut writer = a3s_transport::FrameWriter::new(w);
+
+            let frame = reader.read_frame().await.unwrap().unwrap();
+            assert_eq!(frame.frame_type, a3s_transport::FrameType::Control);
+            assert_eq!(frame.payload, b"signal-main:2");
+
+            writer.write_control(EXEC_SIGNAL_MAIN_ACK).await.unwrap();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let client = ExecClient::connect(&sock_path).await.unwrap();
+        // SIGINT = 2 (image STOPSIGNAL example)
+        let acked = client.signal_main(2).await.unwrap();
+        assert!(acked);
+    }
+
+    #[tokio::test]
+    async fn test_exec_signal_main_nonexistent_socket() {
+        // signal_main on a non-connectable socket returns false, not an error,
+        // so the caller can fall back to a hard stop.
+        let client = ExecClient {
+            socket_path: PathBuf::from("/tmp/nonexistent-signal-main-test.sock"),
+        };
+        let acked = client.signal_main(15).await.unwrap();
+        assert!(!acked);
     }
 
     #[tokio::test]

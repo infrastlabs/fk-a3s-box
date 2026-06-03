@@ -271,6 +271,11 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Container process started with PID {}", container_pid);
 
+    // Make the main container PID available to the exec server so a host
+    // graceful-stop request (signal-main control frame) can deliver the
+    // STOPSIGNAL to it. Must be set before the exec server thread starts.
+    exec_server::set_container_pid(container_pid_raw as i32);
+
     expose_container_env_to_exec(&exec_config);
 
     // Step 8: Start exec server in background thread
@@ -839,14 +844,7 @@ fn remount_rootfs_readonly() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let bind = mount(
-        Some("/"),
-        "/",
-        None::<&str>,
-        MsFlags::MS_BIND,
-        None::<&str>,
-    )
-    .and_then(|_| {
+    let bind = mount(Some("/"), "/", None::<&str>, MsFlags::MS_BIND, None::<&str>).and_then(|_| {
         mount(
             None::<&str>,
             "/",
