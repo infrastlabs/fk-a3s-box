@@ -179,13 +179,19 @@ struct ImageRow {
 
 impl ImageRow {
     fn from_stored(image: &a3s_box_runtime::StoredImage) -> Self {
-        let (repository, tag) = match a3s_box_runtime::ImageReference::parse(&image.reference) {
-            Ok(r) => {
-                let repo = format!("{}/{}", r.registry, r.repository);
-                let tag = r.tag.unwrap_or_else(|| "<none>".to_string());
-                (repo, tag)
+        let (repository, tag) = if crate::image_usage::is_dangling_reference(&image.reference) {
+            // Dangling image (digest-keyed, no repo:tag) — Docker renders it as
+            // `<none> <none>` rather than splitting the digest into repo + tag.
+            ("<none>".to_string(), "<none>".to_string())
+        } else {
+            match a3s_box_runtime::ImageReference::parse(&image.reference) {
+                Ok(r) => {
+                    let repo = format!("{}/{}", r.registry, r.repository);
+                    let tag = r.tag.unwrap_or_else(|| "<none>".to_string());
+                    (repo, tag)
+                }
+                Err(_) => (image.reference.clone(), "<none>".to_string()),
             }
-            Err(_) => (image.reference.clone(), "<none>".to_string()),
         };
 
         // Format digest: "sha256:" prefix + first 12 hex chars
@@ -352,11 +358,27 @@ mod tests {
 
     #[test]
     fn test_from_stored_invalid_reference_fallback() {
-        // Empty reference should fail to parse, falling back to raw reference
+        // An empty reference is treated as dangling and rendered `<none> <none>`,
+        // matching Docker's display for untagged images.
         let stored = sample_stored("", "sha256:abc", 100);
         let row = ImageRow::from_stored(&stored);
 
-        assert_eq!(row.repository, "");
+        assert_eq!(row.repository, "<none>");
+        assert_eq!(row.tag, "<none>");
+    }
+
+    #[test]
+    fn test_from_stored_digest_keyed_dangling_renders_none_none() {
+        // A digest-keyed dangling image (displaced by a re-tag) renders as
+        // `<none> <none>`, not repository="sha256" / tag=<64-char hex>.
+        let stored = sample_stored(
+            "sha256:6c3a24f143efe95ba48765929f1cf75cef0eb96c784f85d588660440796fccbb",
+            "sha256:6c3a24f143efe95ba48765929f1cf75cef0eb96c784f85d588660440796fccbb",
+            100,
+        );
+        let row = ImageRow::from_stored(&stored);
+
+        assert_eq!(row.repository, "<none>");
         assert_eq!(row.tag, "<none>");
     }
 
