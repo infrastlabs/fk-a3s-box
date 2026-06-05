@@ -232,6 +232,9 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
 
     // Track completed stages: (alias, rootfs_path)
     let mut completed_stages: Vec<(Option<String>, PathBuf)> = Vec::new();
+    // Cache external images already pulled+extracted for `COPY --from=<image>`
+    // (keyed by image ref) so multiple copies from one image pull once.
+    let mut external_from_rootfs: HashMap<String, PathBuf> = HashMap::new();
 
     // Create temp directory for build workspace
     let build_dir = tempfile::TempDir::new()
@@ -433,14 +436,29 @@ pub async fn build(config: BuildConfig, store: Arc<ImageStore>) -> Result<BuildR
                                 dst
                             );
                         }
-                        let from_rootfs = resolve_stage_rootfs(from_ref, &completed_stages)?;
+                        // `--from` is a prior stage (by alias or index) or, like
+                        // Docker, an external image reference to pull and copy
+                        // from.
+                        let from_rootfs: PathBuf =
+                            match resolve_stage_rootfs(from_ref, &completed_stages) {
+                                Ok(stage_rootfs) => stage_rootfs.to_path_buf(),
+                                Err(_) => {
+                                    resolve_external_image_rootfs(
+                                        from_ref,
+                                        &store,
+                                        build_dir.path(),
+                                        &mut external_from_rootfs,
+                                    )
+                                    .await?
+                                }
+                            };
                         // .dockerignore applies to the build context, not to a
                         // source stage's rootfs.
                         let layer_info = handle_copy(
                             src,
                             dst,
                             chown.as_deref(),
-                            from_rootfs,
+                            &from_rootfs,
                             &rootfs_dir,
                             &layers_dir,
                             &state.workdir,
@@ -968,6 +986,43 @@ async fn handle_from(
 
     let config = oci_image.config().clone();
     Ok((base_layers, base_diff_ids, config))
+}
+
+/// Resolve `COPY --from=<image>` when `<image>` is not a build stage: pull the
+/// external image and extract it to a temp rootfs to copy from (Docker behavior).
+/// Memoized per build so several copies from one image pull only once.
+async fn resolve_external_image_rootfs(
+    image_ref: &str,
+    store: &Arc<ImageStore>,
+    build_dir: &Path,
+    cache: &mut HashMap<String, PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(dir) = cache.get(image_ref) {
+        return Ok(dir.clone());
+    }
+
+    let dir = build_dir.join(format!("copyfrom_{}", cache.len()));
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        BoxError::BuildError(format!(
+            "Failed to create COPY --from image rootfs {}: {}",
+            dir.display(),
+            e
+        ))
+    })?;
+
+    let puller = ImagePuller::new(store.clone(), RegistryAuth::from_env());
+    let oci_image = puller.pull(image_ref).await.map_err(|e| {
+        BoxError::BuildError(format!(
+            "COPY --from={}: not a build stage and could not be pulled as an image: {}",
+            image_ref, e
+        ))
+    })?;
+    for layer_path in oci_image.layer_paths() {
+        extract_layer(layer_path, &dir)?;
+    }
+
+    cache.insert(image_ref.to_string(), dir.clone());
+    Ok(dir)
 }
 
 fn validate_build_config(config: &BuildConfig) -> Result<()> {
