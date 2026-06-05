@@ -150,6 +150,26 @@ impl ImageStore {
         };
 
         let mut index = self.index.write().await;
+
+        // Docker parity: if this reference already points at a DIFFERENT digest
+        // and that old digest is about to lose its last reference, keep the
+        // displaced image as a dangling entry (keyed by its digest) instead of
+        // dropping it. This makes a rebuilt/re-tagged image show up as
+        // `<none>` in `images`, be removable by `image prune`, and prevents
+        // silently orphaning its on-disk layout.
+        if let Some(old) = index.get(reference).cloned() {
+            if old.digest != digest {
+                let still_referenced = index
+                    .iter()
+                    .any(|(key, img)| key.as_str() != reference && img.digest == old.digest);
+                if !still_referenced && !index.contains_key(&old.digest) {
+                    let mut dangling = old.clone();
+                    dangling.reference = old.digest.clone();
+                    index.insert(old.digest.clone(), dangling);
+                }
+            }
+        }
+
         index.insert(reference.to_string(), stored.clone());
         drop(index);
 
@@ -461,6 +481,55 @@ mod tests {
 
         store.remove("nginx:latest").await.unwrap();
         assert!(store.get("nginx:latest").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_retag_keeps_displaced_image_as_dangling() {
+        // Docker parity: re-pointing a tag at a new digest leaves the old image
+        // as a dangling entry (keyed by its digest), not silently dropped.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put("app:latest", "sha256:old", &source_dir)
+            .await
+            .unwrap();
+        store
+            .put("app:latest", "sha256:new", &source_dir)
+            .await
+            .unwrap();
+
+        // The tag now resolves to the new digest...
+        assert_eq!(store.get("app:latest").await.unwrap().digest, "sha256:new");
+        // ...and the displaced image survives as a digest-keyed dangling entry.
+        let dangling = store.get("sha256:old").await.unwrap();
+        assert_eq!(dangling.digest, "sha256:old");
+        assert_eq!(store.list().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reput_same_digest_does_not_create_dangling() {
+        // Re-putting the same reference at the SAME digest (e.g. pulling latest
+        // when content is unchanged) must not spawn a spurious dangling entry.
+        let tmp = TempDir::new().unwrap();
+        let store_dir = tmp.path().join("store");
+        let source_dir = tmp.path().join("source");
+        create_test_oci_layout(&source_dir);
+
+        let store = ImageStore::new(&store_dir, 10 * 1024 * 1024).unwrap();
+        store
+            .put("app:latest", "sha256:same", &source_dir)
+            .await
+            .unwrap();
+        store
+            .put("app:latest", "sha256:same", &source_dir)
+            .await
+            .unwrap();
+
+        assert_eq!(store.list().await.len(), 1);
     }
 
     #[tokio::test]
