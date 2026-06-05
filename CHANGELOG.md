@@ -92,8 +92,17 @@ All notable changes to A3S Box will be documented in this file.
   instead of leaking the VM, mount, and disk across restarts. A graceful
   shutdown already reaps VMs, so this is a no-op then.
 
+### Added
+- Compose `depends_on` supports `condition: service_completed_successfully`:
+  a dependent waits for its dependency to run to completion (exit 0) before
+  starting. Previously this condition was rejected at config time.
+
 ### Fixed
 - Docker build/runtime parity (found via a 51-case real-Linux probe):
+  - Compose services resolve each other by their bare service name (e.g.
+    `getent hosts db`), not only by the `{project}-{service}` box name —
+    matching Docker Compose service discovery. Network endpoints carry DNS
+    aliases that are written into peers' `/etc/hosts`.
   - `COPY --chown` ownership is now honored at runtime. The layer tar headers
     were stamped correctly, but the rootfs the container saw collapsed to root
     (`stat` reported `0:0`): layer extraction did not set `preserve_ownerships`
