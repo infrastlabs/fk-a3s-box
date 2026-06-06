@@ -189,6 +189,8 @@ pub async fn boot_from_record(
 
     // Activate Prometheus metrics collection
     vm.set_metrics(RuntimeMetrics::try_new()?);
+    // The shim runs the log processor for the box's lifetime.
+    vm.set_log_config(record.log_config.clone());
 
     let mut resource_guard = ensure_boot_resources(record)?;
     if let Err(error) = vm.boot().await {
@@ -206,14 +208,9 @@ pub async fn boot_from_record(
         );
     }
 
-    // Spawn structured log processor (json-file driver writes container.json)
-    let log_dir = record.box_dir.join("logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-    let _log_handle = a3s_box_runtime::log::spawn_log_processor(
-        record.console_log.clone(),
-        log_dir,
-        record.log_config.clone(),
-    );
+    // Ensure the log dir exists so the shim's container.json (and console.log)
+    // have a home; the shim itself runs the log processor.
+    let _ = std::fs::create_dir_all(record.box_dir.join("logs"));
 
     let pid = vm.pid().await;
     let exec_socket_path = vm.exec_socket_path().map(PathBuf::from);

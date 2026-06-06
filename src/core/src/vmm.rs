@@ -151,6 +151,11 @@ pub struct InstanceSpec {
     /// Resource limits (PID limits, CPU pinning, ulimits, cgroup controls).
     #[serde(default)]
     pub resource_limits: ResourceLimits,
+
+    /// Logging driver config. The shim runs the log processor for the box's
+    /// lifetime (so detached `run -d` logs aren't truncated when the CLI exits).
+    #[serde(default)]
+    pub log_config: crate::log::LogConfig,
 }
 
 impl Default for InstanceSpec {
@@ -177,6 +182,7 @@ impl Default for InstanceSpec {
             user: None,
             network: None,
             resource_limits: ResourceLimits::default(),
+            log_config: crate::log::LogConfig::default(),
         }
     }
 }
@@ -413,6 +419,7 @@ mod tests {
             user: Some("1000:1000".to_string()),
             network: None,
             resource_limits: ResourceLimits::default(),
+            log_config: crate::log::LogConfig::default(),
         };
 
         let json = serde_json::to_string(&spec).unwrap();

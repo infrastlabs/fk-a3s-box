@@ -188,6 +188,9 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
 
     let emitter = EventEmitter::new(256);
     let mut vm = VmManager::new(config, emitter);
+    // The shim runs the log processor for the box's lifetime (so detached boxes
+    // keep logging after this CLI exits).
+    vm.set_log_config(log_config.clone());
     let box_id = vm.box_id().to_string();
     println!(
         "Creating box {} ({})...",
@@ -376,11 +379,10 @@ async fn setup_and_boot(args: &RunArgs) -> Result<RunContext, Box<dyn std::error
         .await;
         return Err(error.into());
     }
-    let _log_handle = a3s_box_runtime::log::spawn_log_processor(
-        box_dir.join("logs").join("console.log"),
-        log_dir,
-        log_config,
-    );
+    // Log processing now runs in the shim for the box's lifetime; see
+    // VmManager::set_log_config above. (log_dir is still created so the shim's
+    // container.json has a home.)
+    let _ = &log_dir;
 
     let health_checker = health_check.as_ref().map(|hc| {
         crate::health::spawn_health_checker(box_id.clone(), exec_socket_path.clone(), hc.clone())

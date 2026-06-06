@@ -801,9 +801,36 @@ unsafe fn configure_and_start_vm(spec: &InstanceSpec) -> Result<()> {
     #[cfg(target_os = "linux")]
     apply_cgroup_limits(spec);
 
-    // Start VM (process takeover - never returns on success)
+    // Spawn the log processor on a dedicated thread for the box's lifetime. The
+    // shim owns console.log and lives exactly as long as the VM, so this is the
+    // daemonless home for log processing — a detached `run -d` box keeps logging
+    // after the launching CLI exits (the processor used to die with that CLI).
+    let log_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let log_thread = spec.console_output.as_ref().map(|console| {
+        let console = console.clone();
+        let log_dir = console
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let config = spec.log_config.clone();
+        let stop = log_stop.clone();
+        std::thread::spawn(move || {
+            a3s_box_core::log::run_log_processor(&console, &log_dir, &config, &stop);
+        })
+    });
+
+    // Start VM. start_enter RETURNS with the guest exit status once the guest
+    // exits (status >= 0) or on a start failure (status < 0).
     tracing::info!(box_id = %spec.box_id, "Starting VM (process takeover)");
     let status = ctx.start_enter();
+
+    // Guest has exited and console.log is fully flushed: signal the processor to
+    // drain the remainder and stop, then join so the final lines reach
+    // container.json before this process exits (no teardown race).
+    log_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(handle) = log_thread {
+        let _ = handle.join();
+    }
 
     // If we reach here, either:
     // 1. VM failed to start (negative status)
