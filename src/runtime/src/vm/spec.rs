@@ -332,6 +332,7 @@ impl VmManager {
             user: if has_guest_init { None } else { user },
             network: None, // Network config is set by CLI when --network is specified
             resource_limits: self.config.resource_limits.clone(),
+            log_config: self.log_config.clone(),
         })
     }
 

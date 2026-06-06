@@ -138,6 +138,11 @@ pub struct VmManager {
 
     /// Optional progress callback for image pulls: `(current, total, digest, size_bytes)`.
     pub(crate) pull_progress_fn: Option<PullProgressFn>,
+
+    /// Logging driver config, threaded into the InstanceSpec so the shim runs
+    /// the log processor for the box's lifetime (set by the CLI via
+    /// [`VmManager::set_log_config`]).
+    pub(crate) log_config: a3s_box_core::log::LogConfig,
 }
 
 impl VmManager {
@@ -169,6 +174,7 @@ impl VmManager {
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
+            log_config: a3s_box_core::log::LogConfig::default(),
         }
     }
 
@@ -199,6 +205,7 @@ impl VmManager {
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
+            log_config: a3s_box_core::log::LogConfig::default(),
         }
     }
 
@@ -323,6 +330,7 @@ impl VmManager {
             prom: None,
             shim_exit_code: None,
             pull_progress_fn: None,
+            log_config: a3s_box_core::log::LogConfig::default(),
         }
     }
 
@@ -427,6 +435,12 @@ impl VmManager {
     /// Attach Prometheus metrics to this VM manager.
     pub fn set_metrics(&mut self, metrics: crate::prom::RuntimeMetrics) {
         self.prom = Some(metrics);
+    }
+
+    /// Set the logging driver config. Threaded into the InstanceSpec so the shim
+    /// runs the log processor for the box's lifetime.
+    pub fn set_log_config(&mut self, log_config: a3s_box_core::log::LogConfig) {
+        self.log_config = log_config;
     }
 
     /// Get the attached Prometheus metrics (if any).

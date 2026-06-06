@@ -613,13 +613,9 @@ async fn execute_up(
             );
         }
 
-        // Spawn log processor
-        let log_dir = box_dir.join("logs");
-        let _ = a3s_box_runtime::log::spawn_log_processor(
-            box_dir.join("logs").join("console.log"),
-            log_dir,
-            Default::default(),
-        );
+        // Ensure the log dir exists; the shim runs the log processor (default
+        // json-file driver) for each service box's lifetime.
+        let _ = std::fs::create_dir_all(box_dir.join("logs"));
 
         println!(" ✓");
     }
