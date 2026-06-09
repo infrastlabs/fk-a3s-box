@@ -98,7 +98,7 @@ jobs:
           # update-ca-certificates #for rust-toolchain's curl, 加上后还不行(deb10/11, ubt10)
           # https://curl.se/docs/caextract.html
           cd /etc/ssl/certs; curl -O -k -fSL https://curl.se/ca/cacert-2026-05-14.pem
-          ls -lh
+          ls -lh |wc
           update-ca-certificates
           # 
           # replace the static's curl
