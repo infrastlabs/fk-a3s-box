@@ -227,22 +227,61 @@ jobs:
       #       ${{ env.ASSET }}/*.tar.gz
       #       ${{ env.ASSET }}/${{ matrix.target }} ##a3s-box-v2606-linux-x86_64.tar.gz/linux-x86_64
       # 
-      - name: Create Release
-        uses: ncipollo/release-action@v1.14.0  # 使用支持 Node 16 的最后版本
-        with:
-          artifacts: "${{ env.ASSET }}"
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag: "v26.06"
-          name: "latest-deb9"
-          body: "Release description"
-      # - name: Create Release with gh CLI
+      # - name: Create Release #也是依赖node20..
+      #   uses: ncipollo/release-action@v1.14.0  # 使用支持 Node 16 的最后版本
+      #   with:
+      #     artifacts: "${{ env.ASSET }}"
+      #     token: ${{ secrets.GITHUB_TOKEN }}
+      #     tag: "v26.06"
+      #     name: "latest-deb9"
+      #     body: "Release description"
+      # 
+      # - name: Create Release with gh CLI|curl
       #   env:
       #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       #   run: |
+      #     # 1. 安装依赖
+      #     apt update && apt install -y curl gpg
+      #     # 2. 添加 GitHub CLI 官方仓库
+      #     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+      #     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list
+      #     # 3. 安装 gh
+      #     apt update && apt install -y gh
       #     gh release create v26.06 \
       #       --title "latest-deb9" \
       #       --notes "Release notes" \
       #       path/to/artifact1 path/to/artifact2 ${{ env.ASSET }}
+
+      - name: Create Release
+        id: create_release
+        run: |
+          TAG_NAME=v26.04 #${GITHUB_REF#refs/tags/}
+          
+          response=$(curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/releases \
+            -d "{
+              \"tag_name\": \"$TAG_NAME\",
+              \"name\": \"Release $TAG_NAME\",
+              \"body\": \"Release notes for $TAG_NAME\",
+              \"draft\": false,
+              \"prerelease\": false
+            }")
+          
+          release_id=$(echo "$response" | jq -r '.id')
+          echo "release_id=$release_id" >> $GITHUB_OUTPUT
+          echo "Created release with ID: $release_id"
+      - name: Upload Asset
+        run: |
+          F=${{ env.ASSET }}
+          curl -L -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.create_release.outputs.release_id }}/assets?name=$F" \
+            --data-binary @./$F
+
 
   # ── Create GitHub Release ──────────────────────────────────────
 
