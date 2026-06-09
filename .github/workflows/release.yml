@@ -66,11 +66,13 @@ jobs:
       # image: debian:stretch
       image: registry.cn-shenzhen.aliyuncs.com/infrastlabs/x11-base:core-debian-10
     steps:
-      - uses: actions/checkout@v2 #v4.node20.glibcErr >v2; 还是node20:得glib2.28@deb10 [2.31@ubt20]
+      - name: Init git
+        run: |
+          apt.sh git;
+      - uses: actions/checkout@v4 #v4.node20.glibcErr >v2; 还是node20:得glib2.28@deb10 [2.31@ubt20]
 
       - name: Init submodules
         run: |
-          apt.sh git;
           git -c http.extraheader= submodule update --init --recursive
 
       - uses: dtolnay/rust-toolchain@stable
