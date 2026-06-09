@@ -252,27 +252,46 @@ jobs:
       #       --notes "Release notes" \
       #       path/to/artifact1 path/to/artifact2 ${{ env.ASSET }}
 
-      - name: Create Release
+      - name: Create or get release
         id: create_release
         run: |
           TAG_NAME=v26.04 #${GITHUB_REF#refs/tags/}
           
-          response=$(curl -L -X POST \
+          # 1. 先尝试查询是否已存在
+          existing_response=$(curl -L \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/${{ github.repository }}/releases \
-            -d "{
-              \"tag_name\": \"$TAG_NAME\",
-              \"name\": \"Release $TAG_NAME\",
-              \"body\": \"Release notes for $TAG_NAME\",
-              \"draft\": false,
-              \"prerelease\": false
-            }")
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG_NAME" 2>/dev/null || echo "")
           
-          release_id=$(echo "$response" | jq -r '.id')
-          echo "release_id=$release_id" >> $GITHUB_OUTPUT
-          echo "Created release with ID: $release_id"
+          release_id=$(echo "$existing_response" | jq -r '.id // empty')
+          
+          if [ -n "$release_id" ] && [ "$release_id" != "null" ]; then
+            # 2. 已存在，直接复用
+            echo "release_id=$release_id" >> $GITHUB_OUTPUT
+            echo "Found existing release with ID: $release_id"
+          else
+            # 3. 不存在，创建新 Release
+            echo "Release not found, creating new one..."
+            
+            create_response=$(curl -L -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/${{ github.repository }}/releases \
+              -d "{
+                \"tag_name\": \"$TAG_NAME\",
+                \"name\": \"Release $TAG_NAME\",
+                \"body\": \"Release notes for $TAG_NAME\",
+                \"draft\": false,
+                \"prerelease\": false
+              }")
+            
+            release_id=$(echo "$create_response" | jq -r '.id')
+            echo "release_id=$release_id" >> $GITHUB_OUTPUT
+            echo "Created new release with ID: $release_id"
+          fi
+
       - name: Upload Asset
         run: |
           F=${{ env.ASSET }}
