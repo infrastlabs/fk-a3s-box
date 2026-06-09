@@ -63,7 +63,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
       # image: debian:stretch
-        # core-debian-9/10/11 #deb11.todo; deb10:rust.build.crate-err; deb9:bad glibc for node20
+        # core-debian-9/10/11 #deb11.drop_rust_cache:ok; deb10:rust.build.crate-err; deb9:bad glibc for node20
         # core-ubuntu-16/18/20/22 #ubt22:ok; ubt20.err同deb10; ubt18:- uses: Swatinem/rust-cache@v2 #node24.glibc228@deb10+
       # glib2.28@deb10 [2.31@ubt20; 2.31@same.deb11]
         # ubt26-2.43|ubt24-2.39|ubt22-2.35|ubt20-2.31|ubt18-2.27|ubt16-2.23|ubt14-2.19
@@ -129,7 +129,7 @@ jobs:
       #     pip3 install --break-system-packages ziglang
       #     cargo install cargo-zigbuild
 
-      # rust-cache, cause cargo-err?
+      # rust-cache, cause cargo-err? => deb11.drop_rust_cache:ok;
       # - uses: Swatinem/rust-cache@v2 #node24.glibc228@deb10+
       #   with:
       #     workspaces: src
