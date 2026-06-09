@@ -212,7 +212,7 @@ jobs:
       #     path: ${{ env.ASSET }}
       # 
       # - name: Create release
-      #   uses: softprops/action-gh-release@v1 #v1:node16.glibc217; v2.node20.glibc228;
+      #   uses: softprops/action-gh-release@v1 #v1:node16.glibc217=>也用的node20; v2.node20.glibc228;
       #   # id: new_release
       #   with:
       #     # name: ${{ github.ref_name }}
