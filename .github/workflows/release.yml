@@ -129,10 +129,11 @@ jobs:
       #     pip3 install --break-system-packages ziglang
       #     cargo install cargo-zigbuild
 
-      - uses: Swatinem/rust-cache@v2 #node24.glibc228@deb10+
-        with:
-          workspaces: src
-          key: release-${{ matrix.target }}
+      # rust-cache, cause cargo-err?
+      # - uses: Swatinem/rust-cache@v2 #node24.glibc228@deb10+
+      #   with:
+      #     workspaces: src
+      #     key: release-${{ matrix.target }}
 
       - name: Build host binaries
         run: |
