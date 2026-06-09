@@ -68,7 +68,7 @@ jobs:
       # glib2.28@deb10 [2.31@ubt20; 2.31@same.deb11]
         # ubt26-2.43|ubt24-2.39|ubt22-2.35|ubt20-2.31|ubt18-2.27|ubt16-2.23|ubt14-2.19
         # deb13-2.41|deb12-2.36|deb11-2.31|deb10-2.28|deb9-2.24|deb8-2.19@2015
-      image: registry.cn-shenzhen.aliyuncs.com/infrastlabs/x11-base:core-debian-9 #core-ubuntu-18.04
+      image: registry.cn-shenzhen.aliyuncs.com/infrastlabs/x11-base:core-debian-10 #core-ubuntu-18.04
       # --network host err: --network github_network_d8751a64d59f4356a176883d2cf5adf7 --network host --privileged
       options: --privileged
     steps:
