@@ -64,7 +64,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     container:
       # image: debian:stretch
-      image: registry.cn-shenzhen.aliyuncs.com/infrastlabs/x11-base:core-debian-11
+      # core-debian-10/11 #deb9:bad glibc for node10
+      image: registry.cn-shenzhen.aliyuncs.com/infrastlabs/x11-base:core-ubuntu-20.04
     steps:
       - name: Init git
         run: |
