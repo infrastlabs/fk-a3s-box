@@ -32,6 +32,7 @@ jobs:
               \"draft\": false,
               \"prerelease\": false
             }")
+          echo "$response"
           release_id=$(echo "$response" | jq -r '.id')
           echo "release_id=$release_id" >> $GITHUB_OUTPUT
           echo "Created release with ID: $release_id"
