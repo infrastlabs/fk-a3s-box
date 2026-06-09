@@ -14,7 +14,7 @@ jobs:
         run: |
           # 你的构建步骤
           echo "Building..." && sleep 5
-          touch my-artifact.zip  # 示例：创建假文件
+          echo abc123> my-artifact.zip  # 示例：创建假文件
       
       - name: Create or get release
         id: create_release
