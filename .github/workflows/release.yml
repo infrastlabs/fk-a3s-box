@@ -255,7 +255,7 @@ jobs:
       - name: Create or get release
         id: create_release
         run: |
-          TAG_NAME=v26.04 #${GITHUB_REF#refs/tags/}
+          TAG_NAME=v26.06 #${GITHUB_REF#refs/tags/}
           
           # 1. 先尝试查询是否已存在
           existing_response=$(curl -L \
