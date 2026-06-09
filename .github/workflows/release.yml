@@ -62,6 +62,9 @@ jobs:
           #   build_cri: false
 
     runs-on: ${{ matrix.os }}
+    container:
+      # image: debian:stretch
+      image: registry.cn-shenzhen.aliyuncs.com/infrastlabs/x11-base:core-debian-9
     steps:
       - uses: actions/checkout@v4
 
@@ -256,7 +259,8 @@ jobs:
         # id: new_release
         with:
           # name: ${{ github.ref_name }}
-          name: latest
+          # name: latest
+          name: latest-deb9
           tag_name: v26.06
           make_latest: true
           token: ${{ github.token }} #Defaults to ${{ github.token }}
