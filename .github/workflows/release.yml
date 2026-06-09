@@ -158,7 +158,7 @@ jobs:
 
       - name: Package release
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG=v2606 #"${GITHUB_REF#refs/tags/}"
           DIR="a3s-box-${TAG}-${{ matrix.target }}"
           mkdir -p "$DIR/lib"
 
