@@ -88,6 +88,9 @@ jobs:
           cd /etc/ssl/certs; curl -O -k -fSL https://curl.se/ca/cacert-2026-05-14.pem
           ls -lh
           update-ca-certificates
+          # 
+          # replace the static's curl
+          apt -y install --reinstall curl
 
       # - uses: dtolnay/rust-toolchain@stable
       #   with:
@@ -97,7 +100,7 @@ jobs:
           wget --no-check-certificate https://sh.rustup.rs -O rustup-init.sh
           sh rustup-init.sh -y
           source $HOME/.cargo/env
-          
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
