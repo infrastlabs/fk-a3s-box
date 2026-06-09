@@ -253,9 +253,20 @@ jobs:
 
       - name: Create release
         uses: softprops/action-gh-release@v2
+        # id: new_release
         with:
           # name: ${{ github.ref_name }}
-          name: latest-ubt22
+          name: latest
+          tag_name: v26.06
+          make_latest: true
+          token: ${{ github.token }} #Defaults to ${{ github.token }}
+          # body: |
+          #   Automated release-2026 for tag ${{ github.ref }}          
+          # append_body
+          # draft: false
+          # prerelease: false
+          # preserve_order: true
+          # fail_on_unmatched_files: false
           generate_release_notes: true
           files: |
             artifacts/**/*.tar.gz
