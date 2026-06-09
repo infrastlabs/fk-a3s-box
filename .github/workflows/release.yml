@@ -70,7 +70,7 @@ jobs:
         # deb13-2.41|deb12-2.36|deb11-2.31|deb10-2.28|deb9-2.24|deb8-2.19@2015
     container:
       # image: infrastlabs/x11-base:core-ubuntu-18.04 #core-debian-10 deb9
-      image: registry.cn-shenzhen.aliyuncs.com/infrastlabs/x11-base:core-ubuntu-20.04
+      image: registry.cn-shenzhen.aliyuncs.com/infrastlabs/x11-base:core-ubuntu-18.04
       # --network host err: --network github_network_d8751a64d59f4356a176883d2cf5adf7 --network host --privileged
       options: --privileged
     steps:
@@ -79,9 +79,9 @@ jobs:
           apt.sh git;
           # INFO
           pwd && ls -l
-          docker version
           free -h; df -h; ip a |grep inet; uname -a;
-          docker image prune -a -f; df -h
+          # docker version
+          # docker image prune -a -f; df -h
       # - uses: actions/checkout@v4 #v4.node20.glibcErr >v2; 还是node20:得glib2.28@deb10 [2.31@ubt20]
       - name: Checkout code manually
         run: |
