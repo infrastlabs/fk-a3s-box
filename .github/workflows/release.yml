@@ -89,10 +89,15 @@ jobs:
           ls -lh
           update-ca-certificates
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.guest_target }}
-
+      # - uses: dtolnay/rust-toolchain@stable
+      #   with:
+      #     targets: ${{ matrix.guest_target }}
+      - name: Install Rust via rustup
+        run: |
+          wget --no-check-certificate https://sh.rustup.rs -O rustup-init.sh
+          sh rustup-init.sh -y
+          source $HOME/.cargo/env
+          
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
