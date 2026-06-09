@@ -76,7 +76,7 @@ jobs:
     steps:
       - name: Init git
         run: |
-          apt.sh git;
+          apt.sh git jq;
           # INFO
           pwd && ls -l
           free -h; df -h; ip a |grep inet; uname -a;
