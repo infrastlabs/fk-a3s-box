@@ -90,6 +90,7 @@ jobs:
           update-ca-certificates
           # 
           # replace the static's curl
+          apt update
           apt -y install --reinstall curl
 
       # - uses: dtolnay/rust-toolchain@stable
