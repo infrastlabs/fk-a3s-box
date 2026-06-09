@@ -75,6 +75,9 @@ jobs:
         run: |
           git config --global --add safe.directory /__w/fk-a3s-box/fk-a3s-box
           git -c http.extraheader= submodule update --init --recursive
+          # 
+          # https://www.tutorialpedia.org/blog/how-do-i-deal-with-certificates-using-curl-while-trying-to-access-an-https-url/
+          update-ca-certificates #for rust-toolchain's curl
 
       - uses: dtolnay/rust-toolchain@stable
         with:
