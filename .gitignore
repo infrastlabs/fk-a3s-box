@@ -84,3 +84,5 @@ logs/
 # Git Worktrees
 .worktrees/
 sdk/*/target/
+
+rustup-init.sh
