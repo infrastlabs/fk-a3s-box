@@ -70,6 +70,7 @@ jobs:
 
       - name: Init submodules
         run: |
+          apt.sh git;
           git -c http.extraheader= submodule update --init --recursive
 
       - uses: dtolnay/rust-toolchain@stable
