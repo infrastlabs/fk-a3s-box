@@ -1,0 +1,45 @@
+name: Create Release and Upload Assets
+on:
+  push:
+    branches: [ "main", "dev", "sam-custom" ]
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04 #latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build artifacts
+        run: |
+          # 你的构建步骤
+          echo "Building..." && sleep 5
+          touch my-artifact.zip  # 示例：创建假文件
+      
+      - name: Create Release
+        id: create_release
+        run: |
+          TAG_NAME=v26.06 #${GITHUB_REF#refs/tags/}
+          response=$(curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/releases \
+            -d "{
+              \"tag_name\": \"$TAG_NAME\",
+              \"name\": \"Release $TAG_NAME\",
+              \"body\": \"Release notes for $TAG_NAME\",
+              \"draft\": false,
+              \"prerelease\": false
+            }")
+          release_id=$(echo "$response" | jq -r '.id')
+          echo "release_id=$release_id" >> $GITHUB_OUTPUT
+          echo "Created release with ID: $release_id"
+      
+      - name: Upload Asset
+        run: |
+          curl -L -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/octet-stream" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.create_release.outputs.release_id }}/assets?name=my-artifact.zip" \
+            --data-binary @./my-artifact.zip
