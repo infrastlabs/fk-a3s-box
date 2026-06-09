@@ -64,7 +64,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     container:
       # image: debian:stretch
-      image: registry.cn-shenzhen.aliyuncs.com/infrastlabs/x11-base:core-debian-10
+      image: registry.cn-shenzhen.aliyuncs.com/infrastlabs/x11-base:core-debian-11
     steps:
       - name: Init git
         run: |
@@ -77,7 +77,7 @@ jobs:
           git -c http.extraheader= submodule update --init --recursive
           # 
           # https://www.tutorialpedia.org/blog/how-do-i-deal-with-certificates-using-curl-while-trying-to-access-an-https-url/
-          update-ca-certificates #for rust-toolchain's curl
+          update-ca-certificates #for rust-toolchain's curl, 加上后还不行
 
       - uses: dtolnay/rust-toolchain@stable
         with:
