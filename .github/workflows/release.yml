@@ -210,21 +210,39 @@ jobs:
       #   with:
       #     name: ${{ matrix.target }}
       #     path: ${{ env.ASSET }}
-      - name: Create release
-        uses: softprops/action-gh-release@v1 #v1:node16.glibc217; v2.node20.glibc228;
-        # id: new_release
+      # 
+      # - name: Create release
+      #   uses: softprops/action-gh-release@v1 #v1:node16.glibc217; v2.node20.glibc228;
+      #   # id: new_release
+      #   with:
+      #     # name: ${{ github.ref_name }}
+      #     name: latest-deb9
+      #     tag_name: v26.06
+      #     make_latest: true
+      #     token: ${{ github.token }} #Defaults to ${{ github.token }}
+      #     generate_release_notes: true
+      #     files: |
+      #       # artifacts/**/*.tar.gz
+      #       # artifacts/**/*.zip
+      #       ${{ env.ASSET }}/*.tar.gz
+      #       ${{ env.ASSET }}/${{ matrix.target }} ##a3s-box-v2606-linux-x86_64.tar.gz/linux-x86_64
+      # 
+      - name: Create Release
+        uses: ncipollo/release-action@v1.14.0  # 使用支持 Node 16 的最后版本
         with:
-          # name: ${{ github.ref_name }}
-          name: latest-deb9
-          tag_name: v26.06
-          make_latest: true
-          token: ${{ github.token }} #Defaults to ${{ github.token }}
-          generate_release_notes: true
-          files: |
-            # artifacts/**/*.tar.gz
-            # artifacts/**/*.zip
-            ${{ env.ASSET }}/*.tar.gz
-            ${{ env.ASSET }}/${{ matrix.target }}
+          artifacts: "${{ env.ASSET }}"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: "v26.06"
+          name: "latest-deb9"
+          body: "Release description"
+      # - name: Create Release with gh CLI
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   run: |
+      #     gh release create v26.06 \
+      #       --title "latest-deb9" \
+      #       --notes "Release notes" \
+      #       path/to/artifact1 path/to/artifact2 ${{ env.ASSET }}
 
   # ── Create GitHub Release ──────────────────────────────────────
 
