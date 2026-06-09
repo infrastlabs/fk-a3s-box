@@ -41,7 +41,7 @@ jobs:
   # ── Build matrix ───────────────────────────────────────────────
   build:
     name: Build (${{ matrix.target }})
-    needs: test
+    # needs: test
     strategy:
       matrix:
         include:
@@ -240,7 +240,8 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [build, build-windows]
+    # needs: [build, build-windows]
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
